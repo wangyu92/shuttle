@@ -1,0 +1,19 @@
+{
+  "name": "@shuttle/spike",
+  "version": "0.0.0",
+  "description": "P0 spike plugin, never published (design 7.9).",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "@shuttle/crypto": "0.0.0",
+    "@shuttle/protocol": "0.0.0",
+    "diff-match-patch": "1.0.5"
+  },
+  "devDependencies": {
+    "@types/diff-match-patch": "1.0.36",
+    "obsidian": "1.14.4"
+  }
+}

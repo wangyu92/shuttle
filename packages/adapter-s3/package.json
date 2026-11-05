@@ -1,0 +1,9 @@
+{
+  "name": "@shuttle/adapter-s3",
+  "version": "0.0.0",
+  "description": "S3-compatible remote adapter (design 2.10).",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts"
+}

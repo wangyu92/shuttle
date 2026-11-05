@@ -1,0 +1,4 @@
+/* Shuttle spike styles. */
+.shuttle-spike-warning { color: var(--text-error); font-weight: 600; }
+.shuttle-spike-textarea { width: 100%; min-height: 40vh; font-family: var(--font-monospace); font-size: 12px; }
+.shuttle-spike-state-err { color: var(--text-error); }

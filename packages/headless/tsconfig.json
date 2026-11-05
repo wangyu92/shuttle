@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "../../.tsbuild/headless",
+    "tsBuildInfoFile": "../../.tsbuild/headless.tsbuildinfo",
+    "types": [
+      "node"
+    ]
+  },
+  "include": [
+    "src",
+    "*.ts"
+  ]
+}

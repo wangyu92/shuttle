@@ -1,0 +1,15 @@
+{
+  "name": "@shuttle/engine",
+  "version": "0.0.0",
+  "description": "Sync engine (design 3).",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "diff-match-patch": "1.0.5"
+  },
+  "devDependencies": {
+    "@types/diff-match-patch": "1.0.36"
+  }
+}

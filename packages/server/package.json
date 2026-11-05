@@ -1,0 +1,21 @@
+{
+  "name": "@shuttle/server",
+  "version": "0.0.0",
+  "description": "Own sync server (design 2.8).",
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "private": true,
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "bin": {
+    "shuttle-server": "../../dist/server/shuttle-server.mjs",
+    "shuttle-admin": "../../dist/server/shuttle-admin.mjs"
+  },
+  "dependencies": {
+    "@shuttle/protocol": "0.0.0",
+    "ws": "8.22.1"
+  },
+  "devDependencies": {
+    "@types/ws": "8.18.2"
+  }
+}

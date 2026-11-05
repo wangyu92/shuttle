@@ -1,0 +1,38 @@
+{
+  "files": [],
+  "references": [
+    {
+      "path": "packages/protocol"
+    },
+    {
+      "path": "packages/crypto"
+    },
+    {
+      "path": "packages/engine"
+    },
+    {
+      "path": "packages/adapter-server"
+    },
+    {
+      "path": "packages/adapter-s3"
+    },
+    {
+      "path": "packages/plugin"
+    },
+    {
+      "path": "packages/headless"
+    },
+    {
+      "path": "packages/server"
+    },
+    {
+      "path": "packages/testkit"
+    },
+    {
+      "path": "packages/sim"
+    },
+    {
+      "path": "packages/spike"
+    }
+  ]
+}

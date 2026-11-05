@@ -1,0 +1,48 @@
+{
+  "name": "shuttle-monorepo",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "license": "(MIT AND AGPL-3.0-only)",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "workspaces": [
+    "packages/protocol",
+    "packages/crypto",
+    "packages/engine",
+    "packages/adapter-server",
+    "packages/adapter-s3",
+    "packages/plugin",
+    "packages/headless",
+    "packages/server",
+    "packages/testkit",
+    "packages/sim",
+    "packages/spike"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "build:plugin": "node scripts/build.mjs plugin",
+    "build:headless": "node scripts/build.mjs headless",
+    "build:server": "node scripts/build.mjs server",
+    "build:spike": "node scripts/build.mjs spike",
+    "test": "vitest run",
+    "test:unit": "vitest run",
+    "test:prop": "vitest run packages/crypto/test/envelope.prop.test.ts",
+    "test:int": "vitest run packages/server packages/testkit",
+    "test:e2e": "node -e \"console.log('test:e2e: no end-to-end suite until P1 (design §7)')\"",
+    "lint": "tsc -b --noEmit && node scripts/check-source-rules.mjs",
+    "check-no-native": "node scripts/check-no-native.mjs",
+    "sim": "node -e \"console.log('sim: @shuttle/sim has no runner until P1 (design §7)')\"",
+    "bench": "node -e \"console.log('bench: no benchmarks until P1; device numbers come from the spike (design §10.2)')\"",
+    "dev:server": "node scripts/build.mjs server --dev && node dist/server/shuttle-server.mjs",
+    "dev:plugin": "node scripts/build.mjs plugin --dev"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "esbuild": "0.28.2",
+    "fast-check": "4.10.2",
+    "typescript": "7.0.2",
+    "vitest": "5.1.0"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "../../.tsbuild/adapter-s3",
+    "tsBuildInfoFile": "../../.tsbuild/adapter-s3.tsbuildinfo"
+  },
+  "include": [
+    "src",
+    "*.ts"
+  ]
+}

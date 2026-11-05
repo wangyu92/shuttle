@@ -1,0 +1,12 @@
+{
+  "name": "@shuttle/crypto",
+  "version": "0.0.0",
+  "description": "Crypto suite sx1 on SubtleCrypto (design 4).",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "fflate": "0.8.3"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "..",
+    "outDir": "../../.tsbuild/testkit",
+    "tsBuildInfoFile": "../../.tsbuild/testkit.tsbuildinfo",
+    "types": [
+      "node"
+    ]
+  },
+  "include": [
+    "src",
+    "*.ts",
+    "../spike/src/probes/dmp-cases.ts"
+  ]
+}

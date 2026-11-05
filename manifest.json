@@ -1,0 +1,9 @@
+{
+  "id": "shuttle-spike",
+  "name": "Shuttle Spike",
+  "version": "0.0.1",
+  "minAppVersion": "1.8.7",
+  "description": "P0 platform spike for Shuttle. Not for release.",
+  "author": "Wangyu Choi",
+  "isDesktopOnly": false
+}

@@ -1,0 +1,9 @@
+{
+  "name": "@shuttle/protocol",
+  "version": "0.0.0",
+  "description": "Shared types, validators and pack codec (design 2.12).",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts"
+}

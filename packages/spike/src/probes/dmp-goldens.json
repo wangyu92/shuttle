@@ -1,0 +1,188 @@
+[
+ {
+  "name": "korean-lines",
+  "diffs": [
+   [
+    0,
+    "오늘은 날씨가 "
+   ],
+   [
+    1,
+    "아주 "
+   ],
+   [
+    0,
+    "좋다.\n산책을 했다.\n저녁은 김치찌개.\n"
+   ]
+  ],
+  "patchText": "@@ -1,16 +1,19 @@\n %EC%98%A4%EB%8A%98%EC%9D%80 %EB%82%A0%EC%94%A8%EA%B0%80 \n+%EC%95%84%EC%A3%BC \n %EC%A2%8B%EB%8B%A4.%0A%EC%82%B0%EC%B1%85%EC%9D%84 \n",
+  "merged": "오늘은 날씨가 아주 좋다.\n산책을 했다.\n저녁은 된장찌개.\n메모: 장보기\n",
+  "clean": true,
+  "results": [
+   true
+  ]
+ },
+ {
+  "name": "nfd-hangul",
+  "diffs": [
+   [
+    0,
+    "오늘의 일기\n"
+   ],
+   [
+    1,
+    "긴 "
+   ],
+   [
+    0,
+    "산책을 했다.\n"
+   ]
+  ],
+  "patchText": "@@ -7,16 +7,20 @@\n %E1%85%B4 %E1%84%8B%E1%85%B5%E1%86%AF%E1%84%80%E1%85%B5%0A\n+%E1%84%80%E1%85%B5%E1%86%AB \n %E1%84%89%E1%85%A1%E1%86%AB%E1%84%8E%E1%85%A2%E1%86%A8%E1%84%8B%E1%85%B3\n",
+  "merged": "오늘의 일기\n긴 산책을 했다.\n비가 왔다.\n",
+  "clean": true,
+  "results": [
+   true
+  ]
+ },
+ {
+  "name": "crlf-bom",
+  "diffs": [
+   [
+    0,
+    "﻿# Title\r\nline one"
+   ],
+   [
+    1,
+    " (local)"
+   ],
+   [
+    0,
+    "\r\nline two\r\nline three\r\n"
+   ]
+  ],
+  "patchText": "@@ -11,16 +11,24 @@\n line one\n+ (local)\n %0D%0Aline t\n",
+  "merged": "﻿# Title\r\nline one (local)\r\nline two\r\nline three (remote)\r\n",
+  "clean": true,
+  "results": [
+   true
+  ]
+ },
+ {
+  "name": "emoji-surrogates",
+  "diffs": [
+   [
+    0,
+    "a\ud83d"
+   ],
+   [
+    -1,
+    "\ude00"
+   ],
+   [
+    1,
+    "\ude01"
+   ],
+   [
+    0,
+    "b 🇰🇷 c\n"
+   ]
+  ],
+  "patchText": "ERROR URIError",
+  "merged": "a😁b 🇰🇷 c d\n",
+  "clean": true,
+  "results": [
+   true
+  ]
+ },
+ {
+  "name": "overlap-same-word",
+  "diffs": [
+   [
+    0,
+    "The quick "
+   ],
+   [
+    -1,
+    "b"
+   ],
+   [
+    0,
+    "r"
+   ],
+   [
+    -1,
+    "own"
+   ],
+   [
+    1,
+    "ed"
+   ],
+   [
+    0,
+    " fox jumps over the lazy dog.\n"
+   ]
+  ],
+  "patchText": "@@ -7,13 +7,11 @@\n ick \n-b\n r\n-own\n+ed\n  fox\n",
+  "merged": "The quick red fox jumps over the lazy dog.\n",
+  "clean": true,
+  "results": [
+   true
+  ]
+ },
+ {
+  "name": "delete-vs-edit",
+  "diffs": [
+   [
+    0,
+    "## 할일\n- 우유 사기\n- "
+   ],
+   [
+    -1,
+    "빵 사기\n- "
+   ],
+   [
+    0,
+    "계란 사기\n"
+   ]
+  ],
+  "patchText": "@@ -13,15 +13,8 @@\n %EA%B8%B0%0A- \n-%EB%B9%B5 %EC%82%AC%EA%B8%B0%0A- \n %EA%B3%84%EB%9E%80 %EC%82%AC\n",
+  "merged": "## 할일\n- 우유 사기\n- 계란 사기\n",
+  "clean": true,
+  "results": [
+   true
+  ]
+ },
+ {
+  "name": "medium-8k-crlf",
+  "diffs": [
+   [
+    0,
+    "# 긴 노트\r\n\r\n- 0: 항목 0 item 0 lorem ipsum dolor\r\n- 1: 항목 1 item 919 lorem ipsum dolor\r\n- 2: 항목 2 item 838 lorem ipsum dolor\r\n- 3: 항목 3 item 757 lorem ipsum dolor\r\n- 4: 항목 4 item 676 lorem ipsum dolor\r\n- 5: 항목 5 item 595 lorem ipsum dolor\r\n- 6: 항목 6 item 514 lorem ipsum dolor\r\n- 7: 항목 7 item 433 lorem ipsum dolor\r\n- 8: 항목 8 item 352 lorem ipsum dolor\r\n- 9: 항목 9 item 271 lorem ipsum dolor\r\n- 10: 항목 10 "
+   ],
+   [
+    1,
+    "(수정) "
+   ],
+   [
+    0,
+    "item 190 lorem ipsum dolor\r\n- 11: 항목 11 item 109 lorem ipsum dolor\r\n- 12: 항목 12 item 28 lorem ipsum dolor\r\n- 13: 항목 13 item 947 lorem ipsum dolor\r\n- 14: 항목 14 item 866 lorem ipsum dolor\r\n- 15: 항목 15 item 785 lorem ipsum dolor\r\n- 16: 항목 16 item 704 lorem ipsum dolor\r\n- 17: 항목 17 item 623 lorem ipsum dolor\r\n- 18: 항목 18 item 542 lorem ipsum dolor\r\n- 19: 항목 19 item 461 lorem ipsum dolor\r\n- 20: 항목 20 item 380 lorem ipsum dolor\r\n- 21: 항목 21 item 299 lorem ipsum dolor\r\n- 22: 항목 22 item 218 lorem ipsum dolor\r\n- 23: 항목 23 item 137 lorem ipsum dolor\r\n- 24: 항목 24 item 56 lorem ipsum dolor\r\n- 25: 항목 25 item 975 lorem ipsum dolor\r\n- 26: 항목 26 item 894 lorem ipsum dolor\r\n- 27: 항목 27 item 813 lorem ipsum dolor\r\n- 28: 항목 28 item 732 lorem ipsum dolor\r\n- 29: 항목 29 item 651 lorem ipsum dolor\r\n- 30: 항목 30 item 570 lorem ipsum dolor\r\n- 31: 항목 31 item 489 lorem ipsum dolor\r\n- 32: 항목 32 item 408 lorem ipsum dolor\r\n- 33: 항목 33 item 327 lorem ipsum dolor\r\n- 34: 항목 34 item 246 lorem ipsum dolor\r\n- 35: 항목 35 item 165 lorem ipsum dolor\r\n- 36: 항목 36 item 84 lorem ipsum dolor\r\n- 37: 항목 37 item 3 lorem ipsum dolor\r\n- 38: 항목 38 item 922 lorem ipsum dolor\r\n- 39: 항목 39 item 841 lorem ipsum dolor\r\n- 40: 항목 40 item 760 lorem ipsum dolor\r\n- 41: 항목 41 item 679 lorem ipsum dolor\r\n- 42: 항목 42 item 598 lorem ipsum dolor\r\n- 43: 항목 43 item 517 lorem ipsum dolor\r\n- 44: 항목 44 item 436 lorem ipsum dolor\r\n- 45: 항목 45 item 355 lorem ipsum dolor\r\n- 46: 항목 46 item 274 lorem ipsum dolor\r\n- 47: 항목 47 item 193 lorem ipsum dolor\r\n- 48: 항목 48 item 112 lorem ipsum dolor\r\n- 49: 항목 49 item 31 lorem ipsum dolor\r\n- 50: 항목 50 item 950 lorem ipsum dolor\r\n- 51: 항목 51 item 869 lorem ipsum dolor\r\n- 52: 항목 52 item 788 lorem ipsum dolor\r\n- 53: 항목 53 item 707 lorem ipsum dolor\r\n- 54: 항목 54 item 626 lorem ipsum dolor\r\n- 55: 항목 55 item 545 lorem ipsum dolor\r\n- 56: 항목 56 item 464 lorem ipsum dolor\r\n- 57: 항목 57 item 383 lorem ipsum dolor\r\n- 58: 항목 58 item 302 lorem ipsum dolor\r\n- 59: 항목 59 item 221 lorem ipsum dolor\r\n- 60: 항목 60 item 140 lorem ipsum dolor\r\n- 61: 항목 61 item 59 lorem ipsum dolor\r\n- 62: 항목 62 item 978 lorem ipsum dolor\r\n- 63: 항목 63 item 897 lorem ipsum dolor\r\n- 64: 항목 64 item 816 lorem ipsum dolor\r\n- 65: 항목 65 item 735 lorem ipsum dolor\r\n- 66: 항목 66 item 654 lorem ipsum dolor\r\n- 67: 항목 67 item 573 lorem ipsum dolor\r\n- 68: 항목 68 item 492 lorem ipsum dolor\r\n- 69: 항목 69 item 411 lorem ipsum dolor\r\n- 70: 항목 70 item 330 lorem ipsum dolor\r\n- 71: 항목 71 item 249 lorem ipsum dolor\r\n- 72: 항목 72 item 168 lorem ipsum dolor\r\n- 73: 항목 73 item 87 lorem ipsum dolor\r\n- 74: 항목 74 item 6 lorem ipsum dolor\r\n- 75: 항목 75 item 925 lorem ipsum dolor\r\n- 76: 항목 76 item 844 lorem ipsum dolor\r\n- 77: 항목 77 item 763 lorem ipsum dolor\r\n- 78: 항목 78 item 682 lorem ipsum dolor\r\n- 79: 항목 79 item 601 lorem ipsum dolor\r\n- 80: 항목 80 item 520 lorem ipsum dolor\r\n- 81: 항목 81 item 439 lorem ipsum dolor\r\n- 82: 항목 82 item 358 lorem ipsum dolor\r\n- 83: 항목 83 item 277 lorem ipsum dolor\r\n- 84: 항목 84 item 196 lorem ipsum dolor\r\n- 85: 항목 85 item 115 lorem ipsum dolor\r\n- 86: 항목 86 item 34 lorem ipsum dolor\r\n- 87: 항목 87 item 953 lorem ipsum dolor\r\n- 88: 항목 88 item 872 lorem ipsum dolor\r\n- 89: 항목 89 item 791 lorem ipsum dolor\r\n- 90: 항목 90 item 710 lorem ipsum dolor\r\n- 91: 항목 91 item 629 lorem ipsum dolor\r\n- 92: 항목 92 item 548 lorem ipsum dolor\r\n- 93: 항목 93 item 467 lorem ipsum dolor\r\n- 94: 항목 94 item 386 lorem ipsum dolor\r\n- 95: 항목 95 item 305 lorem ipsum dolor\r\n- 96: 항목 96 item 224 lorem ipsum dolor\r\n- 97: 항목 97 item 143 lorem ipsum dolor\r\n- 98: 항목 98 item 62 lorem ipsum dolor\r\n- 99: 항목 99 item 981 lorem ipsum dolor\r\n- 100: 항목 100 item 900 lorem ipsum dolor\r\n- 101: 항목 101 item 819 lorem ipsum dolor\r\n- 102: 항목 102 item 738 lorem ipsum dolor\r\n- 103: 항목 103 item 657 lorem ipsum dolor\r\n- 104: 항목 104 item 576 lorem ipsum dolor\r\n- 105: 항목 105 item 495 lorem ipsum dolor\r\n- 106: 항목 106 item 414 lorem ipsum dolor\r\n- 107: 항목 107 item 333 lorem ipsum dolor\r\n- 108: 항목 108 item 252 lorem ipsum dolor\r\n- 109: 항목 109 item 171 lorem ipsum dolor\r\n- 110: 항목 110 item 90 lorem ipsum dolor\r\n- 111: 항목 111 item 9 lorem ipsum dolor\r\n- 112: 항목 112 item 928 lorem ipsum dolor\r\n- 113: 항목 113 item 847 lorem ipsum dolor\r\n- 114: 항목 114 item 766 lorem ipsum dolor\r\n- 115: 항목 115 item 685 lorem ipsum dolor\r\n- 116: 항목 116 item 604 lorem ipsum dolor\r\n- 117: 항목 117 item 523 lorem ipsum dolor\r\n- 118: 항목 118 item 442 lorem ipsum dolor\r\n- 119: 항목 119 item 361 lorem ipsum dolor\r\n- 120: 항목 120 item 280 lorem ipsum dolor\r\n- 121: 항목 121 item 199 lorem ipsum dolor\r\n- 122: 항목 122 item 118 lorem ipsum dolor\r\n- 123: 항목 123 item 37 lorem ipsum dolor\r\n- 124: 항목 124 item 956 lorem ipsum dolor\r\n- 125: 항목 125 item 875 lorem ipsum dolor\r\n- 126: 항목 126 item 794 lorem ipsum dolor\r\n- 127: 항목 127 item 713 lorem ipsum dolor\r\n- 128: 항목 128 item 632 lorem ipsum dolor\r\n- 129: 항목 129 item 551 lorem ipsum dolor\r\n- 130: 항목 130 item 470 lorem ipsum dolor\r\n- 131: 항목 131 item 389 lorem ipsum dolor\r\n- 132: 항목 132 item 308 lorem ipsum dolor\r\n- 133: 항목 133 item 227 lorem ipsum dolor\r\n- 134: 항목 134 item 146 lorem ipsum dolor\r\n- 135: 항목 135 item 65 lorem ipsum dolor\r\n- 136: 항목 136 item 984 lorem ipsum dolor\r\n- 137: 항목 137 item 903 lorem ipsum dolor\r\n- 138: 항목 138 item 822 lorem ipsum dolor\r\n- 139: 항목 139 item 741 lorem ipsum dolor\r\n- 140: 항목 140 item 660 lorem ipsum dolor\r\n- 141: 항목 141 item 579 lorem ipsum dolor\r\n- 142: 항목 142 item 498 lorem ipsum dolor\r\n- 143: 항목 143 item 417 lorem ipsum dolor\r\n- 144: 항목 144 item 336 lorem ipsum dolor\r\n- 145: 항목 145 item 255 lorem ipsum dolor\r\n- 146: 항목 146 item 174 lorem ipsum dolor\r\n- 147: 항목 147 item 93 lorem ipsum dolor\r\n- 148: 항목 148 item 12 lorem ipsum dolor\r\n- 149: 항목 149 item 931 lorem ipsum dolor\r\n- 150"
+   ],
+   [
+    1,
+    " (local)"
+   ],
+   [
+    0,
+    ": 항목 150 item 850 lorem ipsum dolor\r\n- 151: 항목 151 item 769 lorem ipsum dolor\r\n- 152: 항목 152 item 688 lorem ipsum dolor\r\n- 153: 항목 153 item 607 lorem ipsum dolor\r\n- 154: 항목 154 item 526 lorem ipsum dolor\r\n- 155: 항목 155 item 445 lorem ipsum dolor\r\n- 156: 항목 156 item 364 lorem ipsum dolor\r\n- 157: 항목 157 item 283 lorem ipsum dolor\r\n- 158: 항목 158 item 202 lorem ipsum dolor\r\n- 159: 항목 159 item 121 lorem ipsum dolor\r\n"
+   ]
+  ],
+  "patchText": "@@ -393,16 +393,21 @@\n : %ED%95%AD%EB%AA%A9 10 \n+(%EC%88%98%EC%A0%95) \n item 190\n@@ -6072,16 +6072,24 @@\n r%0D%0A- 150\n+ (local)\n : %ED%95%AD%EB%AA%A9 150\n",
+  "merged": "# 긴 노트\r\n\r\n- 0: 항목 0 item 0 lorem ipsum dolor\r\n- 1: 항목 1 item 919 lorem ipsum dolor\r\n- 2: 항목 2 item 838 lorem ipsum dolor\r\n- 3: 항목 3 item 757 lorem ipsum dolor\r\n- 4: 항목 4 item 676 lorem ipsum dolor\r\n- 5: 항목 5 item 595 lorem ipsum dolor\r\n- 6: 항목 6 item 514 lorem ipsum dolor\r\n- 7: 항목 7 item 433 lorem ipsum dolor\r\n- 8: 항목 8 item 352 lorem ipsum dolor\r\n- 9: 항목 9 item 271 lorem ipsum dolor\r\n- 10: 항목 10 (수정) item 190 lorem ipsum dolor\r\n- 11: 항목 11 item 109 lorem ipsum dolor\r\n- 12: 항목 12 item 28 lorem ipsum dolor\r\n- 13: 항목 13 item 947 lorem ipsum dolor\r\n- 14: 항목 14 item 866 lorem ipsum dolor\r\n- 15: 항목 15 item 785 lorem ipsum dolor\r\n- 16: 항목 16 item 704 lorem ipsum dolor\r\n- 17: 항목 17 item 623 lorem ipsum dolor\r\n- 18: 항목 18 item 542 lorem ipsum dolor\r\n- 19: 항목 19 item 461 lorem ipsum dolor\r\n- 20: 항목 20 item 380 lorem ipsum dolor\r\n- 21: 항목 21 item 299 lorem ipsum dolor\r\n- 22: 항목 22 item 218 lorem ipsum dolor\r\n- 23: 항목 23 item 137 lorem ipsum dolor\r\n- 24: 항목 24 item 56 lorem ipsum dolor\r\n- 25: 항목 25 item 975 lorem ipsum dolor\r\n- 26: 항목 26 item 894 lorem ipsum dolor\r\n- 27: 항목 27 item 813 lorem ipsum dolor\r\n- 28: 항목 28 item 732 lorem ipsum dolor\r\n- 29: 항목 29 item 651 lorem ipsum dolor\r\n- 30: 항목 30 item 570 lorem ipsum dolor\r\n- 31: 항목 31 item 489 lorem ipsum dolor\r\n- 32: 항목 32 item 408 lorem ipsum dolor\r\n- 33: 항목 33 item 327 lorem ipsum dolor\r\n- 34: 항목 34 item 246 lorem ipsum dolor\r\n- 35: 항목 35 item 165 lorem ipsum dolor\r\n- 36: 항목 36 item 84 lorem ipsum dolor\r\n- 37: 항목 37 item 3 lorem ipsum dolor\r\n- 38: 항목 38 item 922 lorem ipsum dolor\r\n- 39: 항목 39 item 841 lorem ipsum dolor\r\n- 40: 항목 40 item 760 lorem ipsum dolor\r\n- 41: 항목 41 item 679 lorem ipsum dolor\r\n- 42: 항목 42 item 598 lorem ipsum dolor\r\n- 43: 항목 43 item 517 lorem ipsum dolor\r\n- 44: 항목 44 item 436 lorem ipsum dolor\r\n- 45: 항목 45 item 355 lorem ipsum dolor\r\n- 46: 항목 46 item 274 lorem ipsum dolor\r\n- 47: 항목 47 item 193 lorem ipsum dolor\r\n- 48: 항목 48 item 112 lorem ipsum dolor\r\n- 49: 항목 49 item 31 lorem ipsum dolor\r\n- 50: 항목 50 item 950 lorem ipsum dolor\r\n- 51: 항목 51 item 869 lorem ipsum dolor\r\n- 52: 항목 52 item 788 lorem ipsum dolor\r\n- 53: 항목 53 item 707 lorem ipsum dolor\r\n- 54: 항목 54 item 626 lorem ipsum dolor\r\n- 55: 항목 55 item 545 lorem ipsum dolor\r\n- 56: 항목 56 item 464 lorem ipsum dolor\r\n- 57: 항목 57 item 383 lorem ipsum dolor\r\n- 58: 항목 58 item 302 lorem ipsum dolor\r\n- 59: 항목 59 item 221 lorem ipsum dolor\r\n- 60: 항목 60 item 140 lorem ipsum dolor\r\n- 61: 항목 61 item 59 lorem ipsum dolor\r\n- 62: 항목 62 item 978 lorem ipsum dolor\r\n- 63: 항목 63 item 897 lorem ipsum dolor\r\n- 64: 항목 64 item 816 lorem ipsum dolor\r\n- 65: 항목 65 item 735 lorem ipsum dolor\r\n- 66: 항목 66 item 654 lorem ipsum dolor\r\n- 67: 항목 67 item 573 lorem ipsum dolor\r\n- 68: 항목 68 item 492 lorem ipsum dolor\r\n- 69: 항목 69 item 411 lorem ipsum dolor\r\n- 70: 항목 70 item 330 lorem ipsum dolor\r\n- 71: 항목 71 item 249 lorem ipsum dolor\r\n- 72: 항목 72 item 168 lorem ipsum dolor\r\n- 73: 항목 73 item 87 lorem ipsum dolor\r\n- 74: 항목 74 item 6 lorem ipsum dolor\r\n- 75: 항목 75 item 925 lorem ipsum dolor\r\n- 76: 항목 76 item 844 lorem ipsum dolor\r\n- 77: 항목 77 item 763 lorem ipsum dolor\r\n- 78: 항목 78 item 682 lorem ipsum dolor\r\n- 79: 항목 79 item 601 lorem ipsum dolor\r\n- 80: 항목 80 remote item 520 lorem ipsum dolor\r\n- 81: 항목 81 item 439 lorem ipsum dolor\r\n- 82: 항목 82 item 358 lorem ipsum dolor\r\n- 83: 항목 83 item 277 lorem ipsum dolor\r\n- 84: 항목 84 item 196 lorem ipsum dolor\r\n- 85: 항목 85 item 115 lorem ipsum dolor\r\n- 86: 항목 86 item 34 lorem ipsum dolor\r\n- 87: 항목 87 item 953 lorem ipsum dolor\r\n- 88: 항목 88 item 872 lorem ipsum dolor\r\n- 89: 항목 89 item 791 lorem ipsum dolor\r\n- 90: 항목 90 item 710 lorem ipsum dolor\r\n- 91: 항목 91 item 629 lorem ipsum dolor\r\n- 92: 항목 92 item 548 lorem ipsum dolor\r\n- 93: 항목 93 item 467 lorem ipsum dolor\r\n- 94: 항목 94 item 386 lorem ipsum dolor\r\n- 95: 항목 95 item 305 lorem ipsum dolor\r\n- 96: 항목 96 item 224 lorem ipsum dolor\r\n- 97: 항목 97 item 143 lorem ipsum dolor\r\n- 98: 항목 98 item 62 lorem ipsum dolor\r\n- 99: 항목 99 item 981 lorem ipsum dolor\r\n- 100: 항목 100 item 900 lorem ipsum dolor\r\n- 101: 항목 101 item 819 lorem ipsum dolor\r\n- 102: 항목 102 item 738 lorem ipsum dolor\r\n- 103: 항목 103 item 657 lorem ipsum dolor\r\n- 104: 항목 104 item 576 lorem ipsum dolor\r\n- 105: 항목 105 item 495 lorem ipsum dolor\r\n- 106: 항목 106 item 414 lorem ipsum dolor\r\n- 107: 항목 107 item 333 lorem ipsum dolor\r\n- 108: 항목 108 item 252 lorem ipsum dolor\r\n- 109: 항목 109 item 171 lorem ipsum dolor\r\n- 110: 항목 110 item 90 lorem ipsum dolor\r\n- 111: 항목 111 item 9 lorem ipsum dolor\r\n- 112: 항목 112 item 928 lorem ipsum dolor\r\n- 113: 항목 113 item 847 lorem ipsum dolor\r\n- 114: 항목 114 item 766 lorem ipsum dolor\r\n- 115: 항목 115 item 685 lorem ipsum dolor\r\n- 116: 항목 116 item 604 lorem ipsum dolor\r\n- 117: 항목 117 item 523 lorem ipsum dolor\r\n- 118: 항목 118 item 442 lorem ipsum dolor\r\n- 119: 항목 119 item 361 lorem ipsum dolor\r\n- 120: 항목 120 item 280 lorem ipsum dolor\r\n- 121: 항목 121 item 199 lorem ipsum dolor\r\n- 122: 항목 122 item 118 lorem ipsum dolor\r\n- 123: 항목 123 item 37 lorem ipsum dolor\r\n- 124: 항목 124 item 956 lorem ipsum dolor\r\n- 125: 항목 125 item 875 lorem ipsum dolor\r\n- 126: 항목 126 item 794 lorem ipsum dolor\r\n- 127: 항목 127 item 713 lorem ipsum dolor\r\n- 128: 항목 128 item 632 lorem ipsum dolor\r\n- 129: 항목 129 item 551 lorem ipsum dolor\r\n- 130: 항목 130 item 470 lorem ipsum dolor\r\n- 131: 항목 131 item 389 lorem ipsum dolor\r\n- 132: 항목 132 item 308 lorem ipsum dolor\r\n- 133: 항목 133 item 227 lorem ipsum dolor\r\n- 134: 항목 134 item 146 lorem ipsum dolor\r\n- 135: 항목 135 item 65 lorem ipsum dolor\r\n- 136: 항목 136 item 984 lorem ipsum dolor\r\n- 137: 항목 137 item 903 lorem ipsum dolor\r\n- 138: 항목 138 item 822 lorem ipsum dolor\r\n- 139: 항목 139 item 741 lorem ipsum dolor\r\n- 140: 항목 140 item 660 lorem ipsum dolor\r\n- 141: 항목 141 item 579 lorem ipsum dolor\r\n- 142: 항목 142 item 498 lorem ipsum dolor\r\n- 143: 항목 143 item 417 lorem ipsum dolor\r\n- 144: 항목 144 item 336 lorem ipsum dolor\r\n- 145: 항목 145 item 255 lorem ipsum dolor\r\n- 146: 항목 146 item 174 lorem ipsum dolor\r\n- 147: 항목 147 item 93 lorem ipsum dolor\r\n- 148: 항목 148 item 12 lorem ipsum dolor\r\n- 149: 항목 149 item 931 lorem ipsum dolor\r\n- 150 (local): 항목 150 item 850 lorem ipsum dolor\r\n- 151: 항목 151 item 769 lorem ipsum dolor\r\n- 152: 항목 152 item 688 lorem ipsum dolor\r\n- 153: 항목 153 item 607 lorem ipsum dolor\r\n- 154: 항목 154 item 526 lorem ipsum dolor\r\n- 155: 항목 155 item 445 lorem ipsum dolor\r\n- 156: 항목 156 item 364 lorem ipsum dolor\r\n- 157: 항목 157 item 283 lorem ipsum dolor\r\n- 158: 항목 158 item 202 lorem ipsum dolor\r\n- 158.5: 끼워 넣은 줄\r\n- 159: 항목 159 item 121 lorem ipsum dolor\r\n",
+  "clean": true,
+  "results": [
+   true,
+   true
+  ]
+ }
+]

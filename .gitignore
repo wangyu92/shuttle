@@ -1,0 +1,8 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.tsbuild/
+@eaDir/
+.DS_Store
+docs/private/

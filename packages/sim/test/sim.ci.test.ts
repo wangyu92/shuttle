@@ -1,18 +1,17 @@
 // The random simulation in the vitest set (design §7.4 "Runs"; CI runs more seeds through the CLI).
-// Configuration --ci: faults on, user edits only on running devices, restarts finish catch-up first,
-// no excluded folders. Those three switches keep two open engine findings out of the random set;
-// both are pinned by scripted tests in known-issues.sim.test.ts.
+// Configuration: the full default (faults, user edits on dead devices, unsettled restarts, excluded
+// folders). The switches that kept findings A and B out of this set are gone with the fixes (D5, D6).
 import { describe, expect, it } from "vitest";
 import { replayCommand, runSim, type SimOptions } from "../src/index";
 
-const CI: Omit<SimOptions, 'seed'> = { devices: 3, steps: 100, checkEvery: 50, editWhileDown: false, settleRestart: true, excludedFolders: false };
+const CI: Omit<SimOptions, 'seed'> = { devices: 3, steps: 100, checkEvery: 50 };
 
 describe("random multi-device simulation", () => {
   it("20 seeds x 3 devices x 100 steps: every oracle holds", async () => {
     const bad: string[] = [];
     for (let seed = 1; seed <= 20; seed++) {
       const r = await runSim({ seed, ...CI });
-      if (!r.ok) bad.push(`${r.failures.map((f) => `${f.inv}@${f.step}: ${f.detail}`).join(" | ")}\n  replay: ${replayCommand(r, " --ci --check-every 50")}`);
+      if (!r.ok) bad.push(`${r.failures.map((f) => `${f.inv}@${f.step}: ${f.detail}`).join(" | ")}\n  replay: ${replayCommand(r, " --check-every 50")}`);
     }
     expect(bad).toEqual([]);
   }, 300_000);

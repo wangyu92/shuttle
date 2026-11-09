@@ -152,14 +152,27 @@ describe("Reconciler.reconcile (design §3.4.4)", () => {
     expect(lastAction()).toMatchObject({ row: "P1", type: "KEEP_BOTH" });
   });
 
-  it("echo of our own write: obs updated, nothing planned", async () => {
+  it("echo of our own write (content is the synced base): obs updated, nothing planned", async () => {
     const e = await synced("a.md", "x");
     clock.tick(1000);
-    fs.external.write("a.md", "written by engine");
+    // The apply transaction already recorded the new base; the write's event arrives afterwards.
+    fs.external.write("a.md", "x");
     const h = await readAndHash(fs, "a.md");
     echo.expect("a.md", { hash: h.hash, size: h.size });
     expect(await rec.reconcile({ fileId: e.fileId, path: e.path })).toEqual({ t: "echo" });
     expect(exec.calls).toEqual([]);
+    expect(ix.byFileId(e.fileId)!.obs?.hash).toBe(h.hash);
+  });
+
+  it("an echo match never hides content that differs from the base (design §3.6.2)", async () => {
+    // A user edit that equals bytes the engine wrote earlier (a stale expectation) is still planned.
+    const e = await synced("a.md", "x");
+    clock.tick(1000);
+    fs.external.write("a.md", "written by engine earlier, now typed by the user");
+    const h = await readAndHash(fs, "a.md");
+    echo.expect("a.md", { hash: h.hash, size: h.size });
+    expect(await rec.reconcile({ fileId: e.fileId, path: e.path })).toMatchObject({ t: "planned" });
+    expect(lastAction()).toMatchObject({ type: "PUSH_PUT", row: "S2", fileId: e.fileId });
     expect(ix.byFileId(e.fileId)!.obs?.hash).toBe(h.hash);
   });
 

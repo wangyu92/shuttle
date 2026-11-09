@@ -30,6 +30,13 @@ describe("I29 server restore", () => {
     await checkpoint(sim);
 
     expect(sim.guards.filter((g) => g.kind === "rollback").map((g) => g.answer)).toContain("accept");
+    // design §2.6.1: after the accepted snapshot every device's hello carried rollbackAck = rollbackAt,
+    // so the server stopped answering snapshotRequired{rollback} (one prompt per device, no loop).
+    for (const d of sim.devices) {
+      expect(d.net.rollbackAt).toBeNull();
+      expect(d.engine.helloContext().rollbackAck).not.toBeNull();
+      expect(sim.guards.filter((g) => g.kind === "rollback" && g.device === d.name).length).toBe(1);
+    }
     // Every token written after the backup is in the content of a live head.
     const heads = new Set<string>();
     for (const [, bytes] of a.fs.files()) for (const t of tokensOf(bytes)) heads.add(t);

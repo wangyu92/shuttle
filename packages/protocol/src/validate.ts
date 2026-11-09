@@ -113,6 +113,12 @@ function retention(v: unknown, p: string): void {
   for (const k of ["thinAfterHours", "thinBucketMinutes"]) if (optional(o, k)) nonNeg(o[k], `${p}.${k}`);
 }
 
+/** WelcomeLimits (§2.9.2 welcome; also the optional `limits` of /v1/health and /v1/me). Unknown keys pass. */
+function welcomeLimits(v: unknown, p: string): void {
+  const l = obj(v, p);
+  for (const k of Object.keys(DEFAULT_LIMITS)) pos(l[k], `${p}.${k}`);
+}
+
 function vaultInfo(v: unknown, p: string): void {
   const o = obj(v, p);
   lit(o.format, `${p}.format`, [VAULT_INFO_FORMAT]);
@@ -356,8 +362,7 @@ function welcome(o: Rec, p: string): void {
   seq(o.minSeq, `${p}.minSeq`);
   if (o.infoEtag !== null) str(o.infoEtag, `${p}.infoEtag`, 1);
   retention(o.retention, `${p}.retention`);
-  const l = obj(o.limits, `${p}.limits`);
-  for (const k of Object.keys(DEFAULT_LIMITS)) pos(l[k], `${p}.limits.${k}`);
+  welcomeLimits(o.limits, `${p}.limits`);
   pos(o.heartbeatSec, `${p}.heartbeatSec`);
   pos(o.idleTimeoutSec, `${p}.idleTimeoutSec`);
   nonNeg(o.serverTime, `${p}.serverTime`);
@@ -618,6 +623,7 @@ export const validateHealthResponse = run<T.HealthResponse>((v, p) => {
   arr(o.protocols, `${p}.protocols`).forEach((x, i) => pos(x, `${p}.protocols[${i}]`));
   nonNeg(o.time, `${p}.time`);
   str(o.source, `${p}.source`);
+  if (o.limits !== undefined) welcomeLimits(o.limits, `${p}.limits`);
 });
 export const validateAuthResponse = run<T.AuthResponse>((v, p) => {
   const o = obj(v, p);
@@ -629,6 +635,7 @@ export const validateMeResponse = run<T.MeResponse>((v, p) => {
   const o = obj(v, p);
   userInfo(o.user, `${p}.user`);
   deviceInfo(o.device, `${p}.device`);
+  if (o.limits !== undefined) welcomeLimits(o.limits, `${p}.limits`);
 });
 export const validateEnrollCodeResponse = run<T.EnrollCodeResponse>((v, p) => {
   const o = obj(v, p);

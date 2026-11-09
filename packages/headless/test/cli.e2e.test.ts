@@ -12,7 +12,7 @@ import { memoryLogger } from "../src/log";
 import type { Daemon } from "../src/main";
 import { parsePairingLink, sealPairingEnvelope } from "../src/pair";
 import { readSecrets, secretsPath } from "../src/secrets";
-import { createTestVault, ownerAdapter, startWorld, stopWorld, type TestVault, type World } from "./e2eHarness";
+import { createTestVault, ownerAdapter, startWorld, stopWorld, trackOutput, trackSecret, type TestVault, type World } from "./e2eHarness";
 import { sleep, waitFor } from "./tmp";
 
 const T = 300_000;
@@ -27,6 +27,8 @@ afterAll(async () => { await stopWorld(w); }, T);
 
 interface Cap { io: CliIo; out: string[]; err: string[]; daemon: Daemon | null; exits: number[] }
 
+let captures = 0;
+
 function capture(extra: Partial<CliIo> = {}): Cap {
   const c: Cap = { out: [], err: [], daemon: null, exits: [], io: undefined as unknown as CliIo };
   c.io = {
@@ -36,6 +38,8 @@ function capture(extra: Partial<CliIo> = {}): Cap {
     onDaemon: (d) => { c.daemon = d; },
     ...extra,
   };
+  const logger = c.io.logger as ReturnType<typeof memoryLogger>;
+  trackOutput(`cli#${++captures}`, () => [...c.out, ...c.err, ...(logger?.lines ?? [])]);
   return c;
 }
 
@@ -50,8 +54,7 @@ async function enrollCode(): Promise<string> {
 async function setupNode(name: string, mode = "bidirectional"): Promise<{ state: string; vault: string; code: number; cap: Cap }> {
   const root = path.join(w.dir, name);
   const vault = path.join(root, "data/vault");
-  await mkdir(vault, { recursive: true });
-  await mkdir(path.join(root, "data/.shuttle-tmp"), { recursive: true });
+  await mkdir(vault, { recursive: true });   // setup creates <vault parent>/.shuttle-tmp itself
   const state = path.join(root, "st");
   const cap = capture();
   const code = await runCli(["setup", "--server", w.srv.url, "--enroll", await enrollCode(), "--vault", "cli-vault", "--path", vault,
@@ -79,6 +82,7 @@ describe("shuttle-headless CLI", () => {
     const n = await setupNode("mirror");
     expect(n.cap.err).toEqual([]);
     expect(n.code).toBe(0);
+    expect((await stat(path.join(path.dirname(n.vault), ".shuttle-tmp"))).isDirectory()).toBe(true);
     const sfile = secretsPath(n.state, {});
     expect((await stat(sfile)).mode & 0o777).toBe(0o600);
     expect((await stat(path.dirname(sfile))).mode & 0o777).toBe(0o700);
@@ -92,6 +96,7 @@ describe("shuttle-headless CLI", () => {
     await answerPairing(pc.out, realKeys());
     expect(await pairing).toBe(0);
     const s = readSecrets(sfile);
+    trackSecret("mirror.token", s.token);
     expect(s.keys).toEqual(realKeys());
     expect(s.seen?.epoch).toBe(v.info.epoch);
 
@@ -183,7 +188,7 @@ describe("shuttle-headless CLI", () => {
     expect(await runCli(["pair-init", "--state", n.state, "--timeout", "1s"], capture().io)).toBe(13);
   }, T);
 
-  it("setup refuses a bad enroll code (10), an unknown vault (12) and a production path (9)", async () => {
+  it("setup refuses a bad enroll code (10), an unknown vault (12), a production path (9), a missing vault or temp dir (3)", async () => {
     const root = path.join(w.dir, "neg");
     const vault = path.join(root, "vault");
     await mkdir(vault, { recursive: true });
@@ -195,6 +200,25 @@ describe("shuttle-headless CLI", () => {
     expect(await runCli(["setup", "--enroll", "SXE-x", "--vault", "cli-vault", "--server", w.srv.url, "--path", prodVault,
       "--mode", "push-only", "--device-name", "neg", "--state", path.join(root, "st2")], pg.io)).toBe(9);
     expect(existsSync(prodVault)).toBe(false);
+    // A missing vault root is refused (exit 3) before the enroll code is spent; nothing is created.
+    const code = await enrollCode();
+    const missing = path.join(root, "nomount", "vault");
+    const mc = capture();
+    expect(await runCli(["setup", "--enroll", code, "--vault", "cli-vault", "--server", w.srv.url, "--path", missing,
+      "--mode", "bidirectional", "--device-name", "neg", "--state", path.join(root, "st3")], mc.io)).toBe(3);
+    expect(mc.err.join("\n")).toContain("vault path does not exist");
+    expect(existsSync(path.join(root, "nomount"))).toBe(false);
+    // A temp dir that cannot be created (a file is in the way) fails with a clear message (exit 3).
+    await writeFile(path.join(root, "blocked"), "x");
+    const tc = capture();
+    expect(await runCli(["setup", "--enroll", code, "--vault", "cli-vault", "--server", w.srv.url, "--path", vault, "--tmp", path.join(root, "blocked", "tmp"),
+      "--mode", "bidirectional", "--device-name", "neg", "--state", path.join(root, "st3")], tc.io)).toBe(3);
+    expect(tc.err.join("\n")).toContain("cannot create temp dir");
+    // The code survived both refusals.
+    const ok = capture();
+    expect(await runCli(["setup", "--enroll", code, "--vault", "cli-vault", "--server", w.srv.url, "--path", vault,
+      "--mode", "bidirectional", "--device-name", "neg", "--state", path.join(root, "st3")], ok.io)).toBe(0);
+    expect((await stat(path.join(root, ".shuttle-tmp"))).mode & 0o777).toBe(0o700);
     expect(await runCli(["nope"], capture().io)).toBe(1);
     await sleep(10);
   }, T);

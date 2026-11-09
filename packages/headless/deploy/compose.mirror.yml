@@ -2,7 +2,8 @@
 # file (design §2.8.9): `shuttle-server` and the `shuttle` network are defined there. Placeholders: replace /path/to/... and the
 # uid:gid before use. The data mount is the PARENT of the vault (vault = /data/vault, temp =
 # /data/.shuttle-tmp): rename(2) across two bind mounts fails with EXDEV, so temp and vault must share it.
-# Create beforehand: <data>/.shuttle-tmp (775) and <state>/{secret (700),guards,backup}.
+# Create beforehand: <data>/vault and <state>/{secret (700),guards,backup}; `setup` creates <data>/.shuttle-tmp (700) and
+# refuses to run when the vault dir is missing (an unmounted volume must never look like an empty vault).
 services:
   shuttle-mirror:
     image: shuttle-headless:0.1.0

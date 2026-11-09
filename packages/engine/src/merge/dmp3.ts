@@ -9,6 +9,9 @@
 //   1. every DMP hunk applied,
 //   2. no local hunk overlaps or touches a remote hunk in base coordinates (closed intervals, so
 //      adjacent edits and two inserts at the same offset collide; identical hunks are allowed),
+//      after widening every hunk to the whole base lines it touches: a character diff can place two
+//      edits of the same line a few characters apart (one side deletes "1\ntok-1", the other inserts
+//      "8" after it) and splice them into text neither side wrote, losing an edit (sim seed 163),
 //   3. every inserted run of each side is present in the result,
 //   4. the DMP result equals the exact merge obtained by applying both (disjoint) hunk sets to the
 //      base; this implies both sides' insertions AND deletions survived, nothing was duplicated,
@@ -125,6 +128,21 @@ export function hunksCollide(local: readonly Hunk[], remote: readonly Hunk[]): b
   return false;
 }
 
+/**
+ * Widen hunks to the base lines they touch: [start of the first line, end of the last line] (the
+ * line's "\n" excluded, so edits of neighbouring lines never collide). Identical hunks stay identical.
+ */
+export function toLines(base: string, hunks: readonly Hunk[]): Hunk[] {
+  return hunks.map((h) => {
+    const start = h.start === 0 ? 0 : base.lastIndexOf("\n", h.start - 1) + 1;
+    // A deletion that removes a "\n" joins two lines: it then touches the next line too.
+    const from = h.end > h.start && base.charCodeAt(h.end - 1) !== 10 ? h.end - 1 : h.end;
+    const nl = base.indexOf("\n", from);
+    const end = nl < 0 ? base.length : Math.max(nl, start);
+    return { start, end, text: h.text + "\u0000" + String(h.start) + ":" + String(h.end) };
+  });
+}
+
 /** Apply two non-colliding hunk sets to `base` (identical hunks counted once). */
 export function applyDisjoint(base: string, local: readonly Hunk[], remote: readonly Hunk[]): string {
   const all: Hunk[] = [...local];
@@ -170,7 +188,7 @@ export function merge3(base: string, local: string, remote: string, opts: MergeO
 
   const lh = hunksOf(localDiffs);
   const rh = diffHunks(base, remote);
-  if (hunksCollide(lh, rh)) return { text, clean: false, reason: "overlap" };
+  if (hunksCollide(lh, rh) || hunksCollide(toLines(base, lh), toLines(base, rh))) return { text, clean: false, reason: "overlap" };
   for (const h of [...lh, ...rh]) {
     if (h.text !== "" && !text.includes(h.text)) return { text, clean: false, reason: "insertLost" };
   }

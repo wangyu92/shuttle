@@ -21,7 +21,7 @@
 // Each completed listing is diffed against the previous one (non-config files only) to count changes
 // the watcher never reported (passive miss detection, design §6.1.4); see onScan().
 
-import { constants as FS, promises as fsp } from "node:fs";
+import { constants as FS, mkdirSync, promises as fsp, statSync, unlinkSync, writeFileSync } from "node:fs";
 import type { Dirent } from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
@@ -609,4 +609,36 @@ export async function startupChecks(i: StartupCheckInput): Promise<StartupCheckR
     }
   }
   return { ok: failures.length === 0, failures, emptyVault };
+}
+
+/**
+ * `setup`: create the temp dir (design §6.1.3 checks 2-3) and prove it usable, so a fresh daemon starts.
+ * The vault root itself is never created: a missing root is how an unmounted volume looks (I22).
+ * Throws an Error with a message meant for the operator; nothing is created when the vault is missing.
+ */
+export function prepareTmpDir(vaultPath: string, tmpPath: string): void {
+  let vaultDev: number;
+  try {
+    const st = statSync(vaultPath);
+    if (!st.isDirectory()) throw new Error(`vault path is not a directory: ${vaultPath}`);
+    vaultDev = st.dev;
+  } catch (e) {
+    if (codeOf(e) === "ENOENT") throw new Error(`vault path does not exist: ${vaultPath} (create it first; shuttle never creates the vault root, so an unmounted volume is not mistaken for an empty vault)`);
+    throw e;
+  }
+  try {
+    mkdirSync(tmpPath, { recursive: true, mode: 0o700 });
+  } catch (e) {
+    throw new Error(`cannot create temp dir ${tmpPath} (${codeOf(e) ?? String(e)}); pass --tmp <dir> on the vault's filesystem`);
+  }
+  const st = statSync(tmpPath);
+  if (!st.isDirectory()) throw new Error(`temp path is not a directory: ${tmpPath}`);
+  if (st.dev !== vaultDev) throw new Error(`temp dir ${tmpPath} is on another filesystem than the vault (atomic rename impossible); pass --tmp <dir> next to the vault`);
+  const probe = path.join(tmpPath, `.shuttle-tmp-probe-${randomBytes(4).toString("hex")}`);
+  try {
+    writeFileSync(probe, "", { flag: "wx" });
+    unlinkSync(probe);
+  } catch (e) {
+    throw new Error(`temp dir ${tmpPath} is not writable (${codeOf(e) ?? String(e)})`);
+  }
 }

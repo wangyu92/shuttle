@@ -109,6 +109,8 @@ export interface PlanInput {
   ctx: PlanCtx;
   /** Row N6 (rebuild only): hash of the version the tombstone deleted (fetched with getVersion). */
   tombstoneBaseHash?: string | null;
+  /** This device's scope of the live remote head's path (R.path); absent = active. */
+  rScope?: Scope;
 }
 
 const LOG = {
@@ -161,8 +163,9 @@ function decidePathTaken(i: PlanInput, L: LocalState, P: RemoteHead): Action {
     if (own) a.replaces = own;
     return withPre(a, L.path, P.path);
   }
-  // Never re-push the taken path: rename away, then the next pass pushes at the copy path.
-  return { type: "KEEP_BOTH", row: "P1", fileId: own, path: L.path, allowTemplateAdopt: false, log: LOG.pathTaken };
+  // Never re-push the taken path: rename away, then the next pass pushes at the copy path. The holder
+  // is pulled into the freed path right away (its head may already be known, so no apply is queued).
+  return { type: "KEEP_BOTH", row: "P1", fileId: own, path: L.path, allowTemplateAdopt: false, pull: { fileId: P.fileId, seq: P.seq, path: P.path }, log: LOG.pathTaken };
 }
 
 function decideWithBase(i: PlanInput, fileId: FileId, B: SyncedState): Action {
@@ -220,7 +223,19 @@ function decideWithBase(i: PlanInput, fileId: FileId, B: SyncedState): Action {
   // Remote live and changed.
   const rMoved = R.path !== B.path;
   const rContent = R.contentHash !== B.hash;
-  if (!L) return { type: "PULL", row: "C3", fileId: R.fileId, seq: R.seq, path: R.path, log: LOG.restored };
+  if (rMoved && (i.rScope === "excluded" || i.rScope === "ignored")) {
+    // Lead decision D6: the remote moved the file into a folder this device excludes. Never rename the
+    // local file into it: the applier treats the file as gone from scope (an unchanged copy is
+    // removed, a locally changed one stays here as a new file), so nothing is lost and no delete is
+    // pushed.
+    return { type: "PULL", row: "C7", fileId: R.fileId, seq: R.seq, path: R.path };
+  }
+  if (!L) {
+    // A newer head with the base's content at the base's path (an epoch re-create, an echo of a
+    // re-sealed record) is no remote change: the local delete stands, as in S5 (base = the head).
+    if (!rContent && !rMoved) return { type: "PUSH_DELETE", row: "S5", fileId, path: B.path, base: R.seq };
+    return { type: "PULL", row: "C3", fileId: R.fileId, seq: R.seq, path: R.path, log: LOG.restored };
+  }
   if (!lc) {
     if (!rContent && !rMoved) return { type: "ADOPT", row: "S6", fileId: R.fileId, seq: R.seq, path: R.path };
     return { type: "PULL", row: "S6", fileId: R.fileId, seq: R.seq, path: R.path };
@@ -266,6 +281,9 @@ function decideNoBase(i: PlanInput): Action {
     if (i.ctx.mode === "rebuild" && i.tombstoneBaseHash != null && i.tombstoneBaseHash === L.hash && L.mtime <= R.ts) {
       return { type: "LOCAL_DELETE", row: "N6", fileId: own, path: L.path, mode: "trash" };
     }
+    // The entry's own fileId is the tombstoned one (a never-acked pull of it was interrupted): a create
+    // under that fileId would conflict forever; the content takes a new fileId.
+    if (own && own === R.fileId) return { type: "PUSH_CREATE", row: "N1", fileId: null, path: L.path, source: "local", replaces: own };
     return { type: "PUSH_CREATE", row: "N1", fileId: own, path: L.path, source: "local" };
   }
   if (R.contentHash !== null && R.contentHash === L.hash) {
@@ -281,8 +299,10 @@ function decideNoBase(i: PlanInput): Action {
     if (own && own !== R.fileId) a.replaces = own;
     return withPre(a, L.path, R.path);
   }
+  // The entry never got a base for its own head (an interrupted pull): the local bytes are not that
+  // file's content, so they move away as a new file and the head is pulled into the path.
   return {
-    type: "KEEP_BOTH", row: "N5", fileId: own, path: L.path, pull: { fileId: R.fileId, seq: R.seq, path: R.path },
+    type: "KEEP_BOTH", row: "N5", fileId: own === R.fileId ? null : own, path: L.path, pull: { fileId: R.fileId, seq: R.seq, path: R.path },
     allowTemplateAdopt: i.kind === "note", log: LOG.conflict,
   };
 }

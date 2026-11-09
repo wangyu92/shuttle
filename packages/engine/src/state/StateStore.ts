@@ -25,6 +25,13 @@ export interface MetaValues {
   rebuildState: RebuildState;
   paused: boolean;
   mode: SyncMode;
+  /**
+   * The non-incremental plan mode of an unfinished snapshot/epoch/rebuild reconcile (design §3.8.6):
+   * survives a restart so rows S8/C5/C6 still see their mode (never an integrity error for a purge).
+   */
+  planCtx: { mode: 'snapshotResync' | 'epoch' | 'rebuild'; rollbackAccepted?: boolean } | null;
+  /** design §2.6.1 `hello.rollbackAck`: the accepted server restore (`rollbackAt`). */
+  rollbackAck: number | null;
 }
 export type MetaName = keyof MetaValues;
 

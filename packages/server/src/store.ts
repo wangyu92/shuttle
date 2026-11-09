@@ -2,6 +2,7 @@
 // §2.8.5, §2.9.6, §2.9.7). Every method is synchronous. AGPL-3.0-only.
 import {
   ENCSIZE_SLACK,
+  MAX_SEQ,
   checkOpSizes,
   opsDigestPreimage,
   validateRetention,
@@ -290,7 +291,15 @@ export class Store {
       let reuse: Array<OpResult | null> = req.ops.map(() => null);
       if (cached) {
         if (!Buffer.from(cached.ops_digest).equals(digest)) throw new CommitProtocolError("same cid with a different ops digest");
-        const prev = (JSON.parse(cached.result_json) as CommitResponse).results;
+        const stored = JSON.parse(cached.result_json) as CommitResponse | { staleEpoch: number };
+        // A cid from before a rebuild (server-core rebuild): its seqs are gone and its plan targets the old
+        // epoch. Neither replayed nor re-run: the device must bootstrap the new epoch and plan again.
+        if ("staleEpoch" in stored) {
+          throw new HttpError("SNAPSHOT_REQUIRED", `snapshot required (epoch): cid is from epoch ${stored.staleEpoch}`, {
+            details: { minSeq: v.min_seq, epoch: v.epoch, reason: "epoch", rollbackAt: null },
+          });
+        }
+        const prev = stored.results;
         const retry = (r: OpResult): boolean => !r.ok && RETRY_ON_RESEND.has(r.code);
         if (atomic) {
           const allRetryable = prev.every((r) => r.ok || retry(r)) && prev.some((r) => !r.ok);
@@ -301,6 +310,11 @@ export class Store {
         if (reuse.every((r) => r !== null)) {
           return { response: { cid: req.cid, headSeq: v.head_seq, replayed: true, results: prev }, applied: [] };
         }
+      }
+      if (v.head_seq + req.ops.length > MAX_SEQ) {
+        // Never allocate a seq past MAX_SEQ (a bogus hello.seenMaxSeq can raise the head that far):
+        // refuse the commit instead of storing a seq node:sqlite cannot read back.
+        throw new HttpError("INVALID", "seq space of this vault is exhausted");
       }
       const plan = new CommitPlan(this, v, deviceId, req.cid, atomic, this.now(), this.limits);
       const results: OpResult[] = req.ops.map((op, i) => reuse[i] ?? plan.evaluate(op, i));

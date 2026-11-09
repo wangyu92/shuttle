@@ -268,13 +268,14 @@ export interface DeviceInfo {
   deviceId: DeviceId; name: string; platform: string; clientVersion: string | null;
   createdAt: number; lastSeenAt: number | null; revoked: boolean; current: boolean;
 }
-export interface MeResponse { user: UserInfo; device: DeviceInfo }
+/** `limits` (additive): the same values a welcome carries, so REST commits respect them before subscribe. */
+export interface MeResponse { user: UserInfo; device: DeviceInfo; limits?: WelcomeLimits }
 export interface EnrollCodeRequest { ttlSec: number }
 export interface EnrollCodeResponse { code: string; expiresAt: number; link: string }
 export interface DevicesResponse { devices: DeviceInfo[] }
 export interface RenameDeviceRequest { name: string }
 
-export interface HealthResponse { ok: boolean; server: string; protocols: number[]; time: number; source: string }
+export interface HealthResponse { ok: boolean; server: string; protocols: number[]; time: number; source: string; limits?: WelcomeLimits }
 
 export interface VaultSummary {
   vaultId: string; name: string; role: string; createdAt: number; headSeq: Seq;

@@ -2,8 +2,8 @@
 // restore hook, so the sim builds a new server from a backup of the old one through its public
 // (test-internal) surface: vault-info, every retained record and every blob. The seq high-water mark
 // keeps head_seq at the pre-restore value (no seq is reused, ID-10); clients learn about the restore
-// from snapshotRequired{reason:'rollback'}, which SimNet sends until the device accepts (the
-// rollbackAck handshake of §2.6.1 is modelled in SimNet, not in the fake: see openIssues).
+// from snapshotRequired{reason:'rollback'}, which SimNet sends until the device's hello carries the
+// matching rollbackAck (engine.helloContext(), §2.6.1 handshake modelled in SimNet, not in the fake).
 
 import type { BlobId, VaultInfo, VersionRecord } from "@shuttle/protocol";
 import { FakeRemoteServer, type Prng } from "@shuttle/testkit";

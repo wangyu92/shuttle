@@ -1,6 +1,6 @@
 // REST error mapping, URL normalization, timeouts and REST-side adapter calls on a scripted HttpClient.
 import { describe, expect, it } from "vitest";
-import { CloseCode } from "@shuttle/protocol";
+import { CloseCode, DEFAULT_LIMITS } from "@shuttle/protocol";
 import { closeAction, codeFromStatus, errorFromResponse, networkError, normalizeBaseUrls, wsUrlOf } from "../src/index";
 import { harness, json, VID } from "./fakes";
 
@@ -89,6 +89,40 @@ describe("REST calls", () => {
     expect(info).toMatchObject({ deviceId: "D".repeat(22), headSeq: 0, minSeq: 0, infoEtag: null });
     expect(h.http.log.find((r) => r.url.endsWith("/v1/me"))!.headers!["Authorization"]).toBe("Bearer sxd_test");
     expect(h.pool.sockets).toHaveLength(0); // connect() does not start the feed
+  });
+
+  it("connect() reads limits from /v1/me (else /v1/health) so REST commits respect them before subscribe", async () => {
+    const meBody = { user: { userId: "u", username: "alice", role: "owner" }, device: { deviceId: "D".repeat(22), name: "n", platform: "linux", clientVersion: null, createdAt: 1, lastSeenAt: null, revoked: false, current: true } };
+    const op = { op: "del" as const, fileId: "a".repeat(32), base: 1, pathKey: "cGF0aA", rc: "note" as const, kv: 1, meta: "bWV0YQ" };
+    const commitCalls = (h: ReturnType<typeof harness>) => h.http.log.filter((r) => r.url.endsWith("/commit")).length;
+    for (const where of ["me", "health"] as const) {
+      const h = harness();
+      const small = { ...DEFAULT_LIMITS, maxCommitOps: 2, maxBlobSize: 4096 };
+      if (where === "health") h.http.healthLimits = { ...small };
+      h.http.routes.push((r) => r.url.endsWith("/v1/me") ? json(200, where === "me" ? { ...meBody, limits: small } : meBody) : null);
+      h.http.routes.push((r) => r.url.endsWith("/info") ? json(404, { error: { code: "VAULT_NOT_FOUND" } }) : null);
+      h.http.routes.push((r) => r.url.endsWith("/commit")
+        ? json(200, { cid: "6f9619ff-8b86-4011-b42d-00cf4fc964ff", headSeq: 1, replayed: false, results: [{ i: 0, ok: true, seqs: [1] }] })
+        : null);
+      expect(h.adapter.capabilities.limits.maxCommitOps).toBe(DEFAULT_LIMITS.maxCommitOps);
+      const info = await h.adapter.connect();
+      expect(info.capabilities.limits).toMatchObject({ maxCommitOps: 2, maxBlobSize: 4096 });
+      expect(h.adapter.capabilities.limits.maxCommitOps).toBe(2);
+      await expect(h.adapter.commit({ cid: "6f9619ff-8b86-4011-b42d-00cf4fc964ff", ops: [op, op, op] })).rejects.toMatchObject({ code: "TOO_LARGE" });
+      expect(commitCalls(h)).toBe(0); // refused locally, nothing sent
+      await expect(h.adapter.commit({ cid: "6f9619ff-8b86-4011-b42d-00cf4fc964ff", ops: [op] })).resolves.toMatchObject({ headSeq: 1 });
+      expect(commitCalls(h)).toBe(1);
+    }
+  });
+
+  it("connect() keeps the protocol defaults when the server sends no limits", async () => {
+    const h = harness();
+    h.http.routes.push((r) => r.url.endsWith("/v1/me")
+      ? json(200, { user: { userId: "u", username: "alice", role: "owner" }, device: { deviceId: "D".repeat(22), name: "n", platform: "linux", clientVersion: null, createdAt: 1, lastSeenAt: null, revoked: false, current: true } })
+      : null);
+    h.http.routes.push((r) => r.url.endsWith("/info") ? json(404, { error: { code: "VAULT_NOT_FOUND" } }) : null);
+    const info = await h.adapter.connect();
+    expect(info.capabilities.limits.maxCommitOps).toBe(DEFAULT_LIMITS.maxCommitOps);
   });
 
   it("a 404 NOT_FOUND on vault-info is not mistaken for an empty remote", async () => {

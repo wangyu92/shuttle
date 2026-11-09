@@ -120,7 +120,7 @@ describe("I22 guards trip", () => {
     expect(guards).toEqual([]);
   });
 
-  it("massDeleteRemote: incoming deletes above the threshold are held until apply (design §3.8.3)", async () => {
+  it("massDeleteRemote: a burst the sender's user approved is applied without a second question (§3.13)", async () => {
     const { w, a, init, guards } = await syncedVault("guard-remote", 40);
     const b = new Node(w, { name: "beta" });
     await b.start();
@@ -129,8 +129,31 @@ describe("I22 guards trip", () => {
     b.engine.requestScan();
     await b.sync();
     const bg = b.engine.guards.list()[0]!;
+    expect(bg.kind).toBe("massDeleteLocal");
     b.engine.answerGuard(bg.id, "apply");
     await b.sync();
+    expect(deletes(b)).toBe(30);
+    await a.sync();
+    // One answer for the pair: the receiver applies the approved burst (to the trash).
+    expect(guards).toEqual([]);
+    expect(a.fs.files().size).toBe(10);
+    expect(a.fs.trash.length).toBe(30);
+  });
+
+  it("massDeleteRemote: incoming deletes nobody approved are held until apply (design §3.8.3)", async () => {
+    const { w, a, init, guards } = await syncedVault("guard-remote2", 40);
+    const b = new Node(w, { name: "beta" });
+    await b.start();
+    await syncAll([a, b]);
+    // beta deletes in two passes, each at the threshold (no guard there); alpha does not run meanwhile.
+    const victims = Object.keys(init).slice(0, 30);
+    for (const p of victims.slice(0, 15)) b.fs.external.remove(p);
+    b.engine.requestScan();
+    await b.sync();
+    for (const p of victims.slice(15)) b.fs.external.remove(p);
+    b.engine.requestScan();
+    await b.sync();
+    expect(b.engine.guards.list()).toEqual([]);
     expect(deletes(b)).toBe(30);
     await a.sync();
     expect(a.fs.files().size).toBe(40);
@@ -139,6 +162,22 @@ describe("I22 guards trip", () => {
     await a.sync();
     expect(a.fs.files().size).toBe(10);
     expect(a.fs.trash.length).toBe(30);
+  });
+
+  it("massDeleteLocal: one answer covers the whole burst (watcher deletes keep arriving, §7.7)", async () => {
+    const { a, init, guards } = await syncedVault("guard-burst", 60);
+    const victims = Object.keys(init);
+    for (const p of victims.slice(0, 30)) a.fs.external.remove(p);
+    a.engine.requestScan();
+    await a.sync();
+    expect(guards.map((g) => g.kind)).toEqual(["massDeleteLocal"]);
+    a.engine.answerGuard(guards[0]!.id, "apply");
+    // More of the same `rm -r` is reported after the answer (10 files stay: not an empty vault).
+    for (const p of victims.slice(30, 50)) a.fs.external.remove(p);
+    a.engine.requestScan();
+    await a.sync();
+    expect(guards.map((g) => g.kind)).toEqual(["massDeleteLocal"]);
+    expect(deletes(a)).toBe(50);
   });
 
   it("massConflict: a rebuild that would create more than 20 conflict copies pauses until apply", async () => {

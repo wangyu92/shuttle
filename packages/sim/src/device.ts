@@ -142,6 +142,9 @@ export class SimDevice {
       ...(this.cfg.budgets ? { budgets: this.cfg.budgets } : {}),
     });
     this.engine.on("guard", (g) => { this.pendingGuards.push(g); });
+    // design §2.6.1: hello.rollbackAck comes from the engine (the host wires it the same way).
+    const engine = this.engine;
+    this.net.session = () => engine.helloContext();
     if (this.logSink) {
       const sink = this.logSink;
       this.engine.on("log", (e) => { sink(this.name, e.key, { ...e.params, ...(e.path !== undefined ? { path: e.path } : {}) }); });
@@ -247,7 +250,6 @@ export class SimDevice {
           answer = "none";
       }
       this.guards.push({ step: this.step, device: this.name, kind: g.kind, answer });
-      if (g.kind === "rollback" && answer === "accept") this.net.rollbackAt = null;
       if (answer !== "none" && !this.dead) this.engine.answerGuard(g.id, answer as 'apply' | 'accept' | 'pause');
     }
   }

@@ -57,7 +57,15 @@ export function isPosInt(v: unknown): v is number {
 }
 
 /** Seq: vault-wide monotonic safe integer >= 0 (0 = nothing yet; a record's own seq is >= 1). */
-export const isSeq = isNonNegInt;
+/**
+ * Largest seq any party accepts (2^52). Seqs stay exact JavaScript numbers with headroom: SQLite stores
+ * larger integers, but node:sqlite then throws on every read of the row (design §2.4 ID-10).
+ */
+export const MAX_SEQ = 2 ** 52;
+
+export function isSeq(v: unknown): v is number {
+  return isNonNegInt(v) && v <= MAX_SEQ;
+}
 
 /** Decoded byte length of an unpadded base64url string, without allocating. */
 export function b64uDecodedLength(s: string): number {

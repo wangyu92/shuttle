@@ -68,6 +68,8 @@ export class FakeHttp implements HttpClient {
   /** base URL → health behaviour */
   health = new Map<string, "ok" | "down" | "hang" | "old">();
   routes: Route[] = [];
+  /** `limits` the health answer carries (absent when unset, like an older server). */
+  healthLimits: Record<string, number> | null = null;
   async request(req: HttpRequest): Promise<HttpResponse> {
     this.log.push(req);
     const m = /^(.*)\/v1\/health$/.exec(req.url);
@@ -75,7 +77,7 @@ export class FakeHttp implements HttpClient {
       const h = this.health.get(m[1]!) ?? "ok";
       if (h === "down") throw new Error("ECONNREFUSED");
       if (h === "hang") return new Promise(() => { /* never */ });
-      return json(200, { ok: true, server: "0.1.0", protocols: h === "old" ? [2] : [1], time: 1, source: "https://example.com/src" });
+      return json(200, { ok: true, server: "0.1.0", protocols: h === "old" ? [2] : [1], time: 1, source: "https://example.com/src", ...(this.healthLimits ? { limits: this.healthLimits } : {}) });
     }
     for (const r of this.routes) {
       const out = await r(req);

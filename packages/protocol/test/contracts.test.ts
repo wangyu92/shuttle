@@ -4,6 +4,7 @@ import {
   META_KEYS, REMOTE_ERRORS, REMOTE_ERROR_CODES, STATE_SCHEMA, STORE_NAMES, StateStoreError, WIRE_ERRORS,
   isRemoteError, isRemoteErrorCode, isStateStoreError, remoteCodeFromWire, remoteError,
   validatePreconditionFailedDetails, validateSnapshotRequiredDetails,
+  DEFAULT_LIMITS, validateHealthResponse, validateMeResponse,
 } from "../src/index";
 import type { StoreName, StoreValueMap } from "../src/index";
 
@@ -61,5 +62,28 @@ describe("REST detail validators (design §2.8.5)", () => {
   it("PRECONDITION_FAILED details", () => {
     expect(validatePreconditionFailedDetails({ etag: "\"a81f\"" }).ok).toBe(true);
     expect(validatePreconditionFailedDetails({ etag: "" }).ok).toBe(false);
+  });
+});
+
+describe("optional limits on /v1/health and /v1/me (design §2.8.5, §2.9.2 welcome limits)", () => {
+  const health = { ok: true, server: "0.1.0", protocols: [1], time: 1, source: "https://example.invalid/shuttle" };
+  const me = {
+    user: { userId: "u1", username: "alice", role: "owner" },
+    device: { deviceId: "ZGV2aWNlLWlk", name: "laptop", platform: "linux", clientVersion: null, createdAt: 1, lastSeenAt: null, revoked: false, current: true },
+  };
+  it("accepts responses without limits (older servers) and with complete limits", () => {
+    expect(validateHealthResponse(health).ok).toBe(true);
+    expect(validateMeResponse(me).ok).toBe(true);
+    const h = validateHealthResponse({ ...health, limits: { ...DEFAULT_LIMITS, futureKnob: 3 } });
+    expect(h.ok && h.value.limits?.maxCommitOps).toBe(DEFAULT_LIMITS.maxCommitOps);
+    expect(validateMeResponse({ ...me, limits: { ...DEFAULT_LIMITS } }).ok).toBe(true);
+  });
+  it("rejects incomplete or non-positive limits", () => {
+    const { maxCommitOps: _drop, ...partial } = DEFAULT_LIMITS;
+    const r = validateMeResponse({ ...me, limits: partial });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.path).toBe("$.limits.maxCommitOps");
+    expect(validateHealthResponse({ ...health, limits: { ...DEFAULT_LIMITS, maxCommitBytes: 0 } }).ok).toBe(false);
+    expect(validateHealthResponse({ ...health, limits: null }).ok).toBe(false);
   });
 });

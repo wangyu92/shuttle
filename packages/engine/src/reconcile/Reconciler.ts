@@ -41,6 +41,11 @@ export interface ReconcileHooks {
   /** §3.8.4: true when `path` is a torn engine write; reconcile then calls reapply() instead of planning. */
   isTorn?(path: string, st: LocalStat): Promise<boolean>;
   reapply?(path: string): Promise<void>;
+  /**
+   * design §3.8.4: true when `hash` at `path` is the target of this entry's own pull write whose apply
+   * transaction never ran (crash after the write). That content is the engine's, not a user edit.
+   */
+  ownPullTarget?(path: string, fileId: string, hash: string): Promise<boolean>;
   /** §3.15 hash budget (bytes). */
   acquireHash?(bytes: number): Promise<void>;
   releaseHash?(bytes: number): void;
@@ -131,7 +136,10 @@ export class Reconciler {
           L = { path, hash: h.hash, size: h.size, mtime: st.mtime, ...extra(st) };
           if (d.echo.consume(path, { hash: h.hash, size: h.size })) {
             if (e) await d.index.updateObs(e.fileId, observationOf(st, h.hash));
-            return { t: "echo" };
+            // design §3.6.2: correctness never depends on echo matching. Content that differs from the
+            // synced base (a user edit that happens to equal bytes the engine wrote earlier, a merge
+            // write not yet acked) is still planned; the Planner sees S1 for a true echo anyway.
+            if (!e?.synced || e.synced.hash === h.hash) return { t: "echo" };
           }
         }
       }
@@ -145,10 +153,17 @@ export class Reconciler {
         tombstoneBaseHash = await d.hooks.tombstoneBaseHash(R);
       }
       const s = d.settings();
+      // A completed pull write whose apply transaction was lost to a crash is no local change: plan it
+      // as unchanged, so a newer head or tombstone applies instead of being pushed over (sim 736).
+      let Lplan = L;
+      if (L && e?.synced && L.hash !== e.synced.hash && d.hooks?.ownPullTarget && (await d.hooks.ownPullTarget(path, e.fileId, L.hash))) {
+        Lplan = { ...L, hash: e.synced.hash };
+      }
       const planned = decide({
-        L, R, P: key.pathTaken ?? null, path, scope: sc, kind, configJson: d.isConfigJson(path), conflictMode: s.conflictMode, ctx,
+        L: Lplan, R, P: key.pathTaken ?? null, path, scope: sc, kind, configJson: d.isConfigJson(path), conflictMode: s.conflictMode, ctx,
         entry: e ? { fileId: e.fileId, path: e.path, synced: e.synced, ...(e.integrityHold ? { integrityHold: true } : {}) } : null,
         tombstoneBaseHash,
+        ...(R && !R.deleted && R.path !== path ? { rScope: d.scopeOf(R.path, R.size) } : {}),
       });
       const action = applySyncMode(planned, s.mode, R);
       // Observation recorded before the action: an executor that wrote the file (pull, merge, copy)

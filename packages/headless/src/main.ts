@@ -6,7 +6,7 @@ import { readFileSync, readdirSync, renameSync, rmSync, statSync, mkdirSync, wri
 import path from "node:path";
 import WebSocket from "ws";
 import type {
-  DebugInfo, GuardChoice, GuardEvent, HttpClient, Keyring, LogEntry, StateStore, VaultInfo, WsFactory, WsLike,
+  DebugInfo, GuardChoice, GuardEvent, HttpClient, Keyring, LogEntry, RemoteAdapter, StateStore, VaultInfo, WsFactory, WsLike,
 } from "@shuttle/protocol";
 import { adapterStateStoreOver, isStateStoreError } from "@shuttle/protocol";
 import { SxKeyring, fromB64u, fromCache, isCryptoError, type CachedSecrets, type Seen, type VaultInfo as CryptoVaultInfo } from "@shuttle/crypto";
@@ -14,7 +14,7 @@ import {
   ENGINE_VERSION, createEngine, readMeta, type EventTimings, type LocalRecordStore, type SeenStore, type ShuttleEngine,
 } from "@shuttle/engine";
 import type { LocalRecord } from "@shuttle/engine";
-import { ServerAdapter, fetchHttpClient } from "@shuttle/adapter-server";
+import { ServerAdapter, fetchHttpClient, helloSession } from "@shuttle/adapter-server";
 import { deviceSettingsOf, scanIntervalMs, watchModeOf, type HeadlessConfig } from "./config";
 import { NodeLocalFs, startupChecks } from "./NodeLocalFs";
 import { SqliteStateStore } from "./state/SqliteStateStore";
@@ -66,6 +66,10 @@ export interface DaemonOptions {
   missGraceMs?: number;
   /** Uptime before the first nightly backup may run (VACUUM INTO blocks the loop; default 10 min). */
   backupDelayMs?: number;
+  /** Wall clock for health, progress and the watchdog (tests run health on fake time; default Date.now). */
+  now?: () => number;
+  /** Test hook: wraps the remote the engine sees (inside the progress tracker), e.g. to inject a stall. */
+  remoteHook?: (r: RemoteAdapter) => RemoteAdapter;
 }
 
 /**
@@ -194,11 +198,16 @@ export class Daemon {
   private lastBackupDay = "";
   private stopped = false;
   private ticking: Promise<void> | null = null;
+  private tickPending: Promise<void> | null = null;
   private seenStore: SecretsSeenStore | null = null;
+  private readonly now: () => number;
+  /** Startup phase durations in ms (logged with "started"; design §6.1.3 order). */
+  readonly startupPhases: Record<string, number> = {};
 
   constructor(o: DaemonOptions) {
     this.o = o;
     this.env = o.env ?? process.env;
+    this.now = o.now ?? Date.now;
   }
 
   get stateFile(): string { return path.join(this.o.stateDir, "state.db"); }
@@ -219,8 +228,16 @@ export class Daemon {
   private async startInner(): Promise<void> {
     const c = this.o.config;
     const log = this.o.log;
-    this.startedAt = Date.now();
+    this.startedAt = this.now();
+    this.heartbeatAt = this.startedAt;
     this.healthClock = new HealthClock(this.startedAt);
+    let phaseAt = performance.now();
+    const phase = (name: string): void => {
+      const t = performance.now();
+      this.startupPhases[name] = Math.round(t - phaseAt);
+      phaseAt = t;
+      log.debug("startup", `${name} done`, { ms: this.startupPhases[name] });
+    };
     // (4) prodGuard: vault, temp and state paths; dev URLs in production.
     checkPaths([c.vaultPath, c.tmpPath, this.o.stateDir], this.env);
     checkServerUrls(c.remote.urls, this.env);
@@ -236,7 +253,7 @@ export class Daemon {
       if (isStateStoreError(e, "NEWER_SCHEMA")) throw new StartupError((e as Error).message, EXIT.person);
       throw e;
     }
-    log.debug("startup", "state db open");
+    phase("stateDb");
     const indexedActive = await this.state.tx(["files"], async (tx) => {
       let n = 0;
       for (const e of await tx.files.getAll({ index: "scope", only: "active" })) if (e.obs !== null) n++;
@@ -267,9 +284,13 @@ export class Daemon {
       client: { name: c.device.name, platform: "linux", version: HEADLESS_VERSION, role: "headless" },
       state: adapterStateStoreOver(this.state),
       allowHttp: c.remote.allowHttp ?? false,
+      // design §2.6.1: hello seenMaxSeq / rollbackAck come from the engine (the epoch stays the adapter's).
+      session: () => helloSession(this.engine?.helloContext() ?? null),
     });
-    const wrapped = wrapRemote(this.adapter, { mode: c.mode });
+    const wrapped = wrapRemote(this.adapter, { mode: c.mode, now: this.now });
     this.progress = wrapped.progress;
+    const engineRemote = this.o.remoteHook ? this.o.remoteHook(wrapped.remote) : wrapped.remote;
+    phase("checks");
 
     log.debug("startup", "building keyring");
     const k = await buildKeyring(this.secrets, async () => {
@@ -277,10 +298,11 @@ export class Daemon {
       return (await this.adapter.getVaultInfo())?.info ?? null;
     }, log);
     if (k.info) this.rememberRing(k.info);
+    phase("keyring");
 
     const sfileForSeen = sfile;
     this.engine = createEngine({
-      fs: this.fs, state: this.state as StateStore, remote: wrapped.remote, keyring: k.ring,
+      fs: this.fs, state: this.state as StateStore, remote: engineRemote, keyring: k.ring,
       clock: { now: () => Date.now(), monotonic: () => performance.now() },
       scheduler: realScheduler(),
       adapterState: adapterStateStoreOver(this.state),
@@ -305,13 +327,13 @@ export class Daemon {
     // has been running for longer than stallSec is a stall, an idle loop is alive.
     const runOnce = this.engine.runOnce.bind(this.engine);
     this.engine.runOnce = async (o) => {
-      this.iterationStartedAt = Date.now();
+      this.iterationStartedAt = this.now();
       this.heartbeatAt = this.iterationStartedAt;
       try {
         return await runOnce(o);
       } finally {
         this.iterationStartedAt = null;
-        this.heartbeatAt = Date.now();
+        this.heartbeatAt = this.now();
       }
     };
     this.engine.on("guard", (g) => this.onGuard(g));
@@ -325,10 +347,15 @@ export class Daemon {
       ...(this.o.missGraceMs !== undefined ? { missGraceMs: this.o.missGraceMs } : {}),
     });
 
-    log.debug("startup", "starting engine");
-    await this.engine.start();
-    log.debug("startup", "starting watcher");
+    // The watcher starts before the engine: its tree walks (budget count, one fs.watch per directory)
+    // are async readdirs, and once the engine runs, every state commit blocks the event loop for one
+    // fsync (synchronous=FULL, ~100-250 ms on the NAS), so a walk interleaved with startup sync work
+    // took seconds per hundred directories. Events before the engine subscribes are not lost: the
+    // engine's startup scan (after it subscribes) finds every change made before it.
     await this.watcher.start();
+    phase("watcher");
+    await this.engine.start();
+    phase("engine");
     mkdirSync(this.guardsDir, { recursive: true });
     if (this.o.control !== false) {
       this.control = new ControlServer(this.socketPath, {
@@ -346,7 +373,7 @@ export class Daemon {
     }
     if (!this.o.manual) {
       this.supervisor = new Supervisor({
-        log, stallSec: c.watchdog.stallSec, heartbeat: () => (this.iterationStartedAt === null ? Date.now() : this.heartbeatAt),
+        log, stallSec: c.watchdog.stallSec, heartbeat: () => (this.iterationStartedAt === null ? this.now() : this.heartbeatAt), now: this.now,
         paused: () => { const s = this.engine.status(); return s.status === "paused" || s.locked || this.engine.guards.list().length > 0; },
         shutdown: () => this.stop(),
         installProcessHandlers: this.o.installProcessHandlers ?? true,
@@ -357,8 +384,11 @@ export class Daemon {
     const every = this.o.healthEveryMs ?? 15_000;
     this.healthTimer = setInterval(() => { void this.tick(); }, every);
     this.healthTimer.unref();
+    phase("control");
     await this.tick();
-    log.info("general", "shuttle-headless started", { mode: c.mode, watch: this.watcher.stats.mode });
+    phase("health");
+    const startupMs = Object.values(this.startupPhases).reduce((a, b) => a + b, 0);
+    log.info("general", "shuttle-headless started", { mode: c.mode, watch: this.watcher.stats.mode, startupMs, phases: { ...this.startupPhases } });
   }
 
   private isConfigRel(rel: string): boolean {
@@ -428,12 +458,28 @@ export class Daemon {
     return this.health;
   }
 
+  /**
+   * Recompute health.json. A call while a computation is running gets a fresh one after it (shared by
+   * every caller meanwhile): the running one read its inputs before this call, and handing its result
+   * back would report a state older than the caller asked about.
+   */
   async tick(): Promise<void> {
-    if (this.ticking) return this.ticking;
-    this.ticking = (async () => {
+    if (this.ticking) {
+      this.tickPending ??= (async () => {
+        while (this.ticking) await this.ticking.catch(() => undefined);
+        this.tickPending = null;
+        await this.runTick();
+      })();
+      return this.tickPending;
+    }
+    return this.runTick();
+  }
+
+  private async runTick(): Promise<void> {
+    const p = (async () => {
       try {
         if (this.stopped) return;
-        const now = Date.now();
+        const now = this.now();
         const st = this.engine.status();
         if (this.iterationStartedAt === null) this.heartbeatAt = now;
         const cursor = (await readMeta(this.state, "cursor").catch(() => undefined)) ?? null;
@@ -464,15 +510,16 @@ export class Daemon {
         this.o.log.error("health", "health update failed", { err: String(e) });
       }
     })();
+    this.ticking = p;
     try {
-      await this.ticking;
+      await p;
     } finally {
-      this.ticking = null;
+      if (this.ticking === p) this.ticking = null;
     }
   }
 
   private async writeFailedHealth(): Promise<void> {
-    const now = Date.now();
+    const now = this.now();
     const h = computeHealth({
       now, engine: { status: "error", pendingUp: 0, pendingDown: 0, failed: 0, locked: false, readOnly: false, reason: "startup" },
       mode: this.o.config.mode, version: HEADLESS_VERSION, connected: false, connectedSince: null, disconnectedSince: null,
@@ -519,6 +566,7 @@ export class Daemon {
     await this.control?.stop().catch(() => undefined);
     await this.engine?.stop().catch((e: unknown) => this.o.log.error("general", "engine stop failed", { err: String(e) }));
     await this.adapter?.close().catch(() => undefined);
+    await this.tickPending?.catch(() => undefined);
     await this.ticking?.catch(() => undefined);
     try { this.seenStore?.flush(); } catch (e) { this.o.log.error("general", "cannot save seen", { err: String(e) }); }
     await this.state?.close().catch(() => undefined);

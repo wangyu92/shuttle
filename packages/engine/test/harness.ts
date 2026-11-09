@@ -208,11 +208,13 @@ export class Device {
         renames: this.renames,
       },
     });
-    // design §3.8.4: leftover intents are checked before the first scan.
-    for (const t of await this.intents.startupCheck()) await this.applier.applyOne(t.fileId, { planned: true, torn: t.path });
+    // design §3.8.4: leftover intents are checked before the first scan; D5 classifies the foreign
+    // ones (needs the target bytes) once connected.
+    const foreign = await this.intents.startupCheck();
     await this.runner.resume();
     markPendingLocalChanges(this.index, markDirty);
     await this.remote.connect();
+    for (const t of foreign) await this.applier.reapplyAt(t.path, t.fileId);
     const cursor = (await readMeta(this.store, "cursor")) ?? 0;
     this.sub = this.remote.subscribe(cursor, this.ingest);
   }

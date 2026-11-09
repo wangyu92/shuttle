@@ -108,3 +108,25 @@ describe("hunk helpers", () => {
     expect(isWellFormedUtf16("\ude00a")).toBe(false);
   });
 });
+
+describe("strictOverlap: line-level collisions (sim seed 163)", () => {
+  it("an edit and a line deletion that a character diff places apart on the same line are not merged", () => {
+    const base = "tok-7\ntok-28\ntok-9\ntok-19\ntok-31\ntok-11\ntok-12\ntok-70\n";
+    const local = "tok-7\ntok-28\ntok-9\ntok-19\ntok-31\ntok-118\ntok-12\ntok-70\n";
+    const remote = "tok-110\ntok-28\ntok-119\ntok-9\ntok-19\ntok-31\ntok-12\ntok-70\n";
+    const m = merge3(base, local, remote);
+    // The old result "tok-318" kept neither side's line; a conflict copy keeps both (I6).
+    expect(m.clean).toBe(false);
+    expect(m.reason).toBe("overlap");
+  });
+  it("edits of neighbouring lines still merge cleanly", () => {
+    const base = "a1\nb1\nc1\n";
+    const m = merge3(base, "a2\nb1\nc1\n", "a1\nb2\nc1\n");
+    expect(m).toEqual({ text: "a2\nb2\nc1\n", clean: true });
+  });
+  it("a deletion that joins two lines collides with an edit of the next line", () => {
+    const base = "a1\nb1\nc1\n";
+    const m = merge3(base, "a1b1\nc1\n", "a1\nb2\nc1\n");
+    expect(m.clean).toBe(false);
+  });
+});

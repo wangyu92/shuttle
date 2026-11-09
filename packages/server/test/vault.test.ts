@@ -105,7 +105,7 @@ describe("vaults", () => {
     ws.close();
   });
 
-  it("rebuild: epoch atomically equal to info.epoch, head_seq kept, other sockets get snapshotRequired{epoch}", async () => {
+  it("rebuild: epoch atomically equal to info.epoch, head_seq kept, only OTHER devices get snapshotRequired{epoch} (§2.11 step 5)", async () => {
     const v = await createVault(srv, c, "rebuild");
     const phone = await login(srv, "alice", "phone");
     const a = await TestWs.open(srv);
@@ -114,18 +114,106 @@ describe("vaults", () => {
     const b = await TestWs.open(srv);
     await b.connect(phone.token, v);
     expect((await api(srv, c, "POST", `/v1/vaults/${v}/rebuild`, { info: makeInfo(v, { epoch: 3, infoRev: 2 }) })).json.error.code).toBe("INVALID");
+    a.frames = [];
     const r = await api(srv, c, "POST", `/v1/vaults/${v}/rebuild`, { info: makeInfo(v, { epoch: 2, infoRev: 2 }) });
     expect(r.status).toBe(200);
     expect(r.json).toEqual({ epoch: 2, headSeq: 2 });
     expect(await b.type("snapshotRequired")).toMatchObject({ reason: "epoch", epoch: 2, minSeq: 2 });
     const snap = await api(srv, c, "GET", `/v1/vaults/${v}/snapshot`);
     expect(snap.json).toMatchObject({ headSeq: 2, epoch: 2, records: [] });
-    // Uploads after the rebuild continue the seq (ID-10)
-    const { welcome } = await b.connect(phone.token, v, { since: 2, epoch: 2 });
+    // The rebuilding device keeps its feed: no snapshotRequired, and step 4's creates go out on the same
+    // socket at the new epoch. Seqs continue (ID-10) and its own commit comes back on the live feed.
+    const up = await a.commit([putOp(fileId(), null, pathKey())]);
+    expect((up.results[0] as { seqs: number[] }).seqs[0]).toBe(3);
+    const echo = await a.take((f) => f.type === "changes" && (f.records as unknown[]).length > 0);
+    expect(echo).toMatchObject({ to: 3, headSeq: 3 });
+    expect(a.frames.some((f) => f.type === "snapshotRequired")).toBe(false);
+    // The other device bootstraps the new epoch on the same socket and continues the seq too.
+    const { welcome } = await b.connect(phone.token, v, { since: 3, epoch: 2 });
     expect(welcome.epoch).toBe(2);
     const res = await b.commit([putOp(fileId(), null, pathKey())]);
-    expect((res.results[0] as { seqs: number[] }).seqs[0]).toBe(3);
+    expect((res.results[0] as { seqs: number[] }).seqs[0]).toBe(4);
     a.close(); b.close();
+  });
+
+  it("rebuild: the caller's socket that is still catching up is bridged over the dropped range, not parked", async () => {
+    const v = await createVault(srv, c, "rebuild-catchup");
+    const w = await TestWs.open(srv);
+    await w.connect(c.token, v);
+    for (let i = 0; i < 3; i++) await w.commit(Array.from({ length: 400 }, () => putOp(fileId(), null, pathKey())));
+    w.close();
+    // Same device, a socket stuck in catch-up: the first page (1000 of 1200 heads) exceeds its window.
+    const a = await TestWs.open(srv);
+    a.hello(c.token, v, { since: 0, window: { maxUnackedBytes: 1 } });
+    const page = await a.take((f) => f.type === "changes");
+    expect(page).toMatchObject({ from: 0, more: true });
+    const stuckAt = page.to as number;
+    expect(stuckAt).toBeLessThan(1200);
+    expect((await api(srv, c, "POST", `/v1/vaults/${v}/rebuild`, { info: makeInfo(v, { epoch: 2, infoRev: 2 }) })).status).toBe(200);
+    expect(await a.take((f) => f.type === "changes")).toMatchObject({ from: stuckAt, to: 1200, records: [], more: true, minSeq: 1200 });
+    const up = await a.commit([putOp(fileId(), null, pathKey())]);
+    expect((up.results[0] as { seqs: number[] }).seqs[0]).toBe(1201);
+    a.send({ type: "ack", upTo: 1200 });
+    expect(await a.take((f) => f.type === "changes" && f.from === 1200)).toMatchObject({ to: 1201 });
+    expect(a.frames.some((f) => f.type === "snapshotRequired")).toBe(false);
+    a.close();
+  });
+
+  it("rebuild: the caller's live socket behind the head is bridged to the new min_seq", async () => {
+    // Dedicated server with a long live-coalescing window, so the caller's cursor lags the head when the
+    // rebuild lands (a commit by another device is waiting in the live buffer).
+    const ldir = await tempDir("vault-live");
+    const ls = await start(ldir, { coalesceMs: 3000 });
+    try {
+      const { c: owner, vid: v } = await fixture(ls, ldir);
+      const a = await TestWs.open(ls);
+      await a.connect(owner.token, v);
+      const phone = await login(ls, "alice", "phone-live");
+      const p = await TestWs.open(ls);
+      await p.connect(phone.token, v);
+      await p.commit([putOp(fileId(), null, pathKey())]);
+      a.frames = [];
+      expect((await api(ls, owner, "POST", `/v1/vaults/${v}/rebuild`, { info: makeInfo(v, { epoch: 2, infoRev: 2 }) })).status).toBe(200);
+      expect(await a.take((x) => x.type === "changes", 1500)).toMatchObject({ from: 0, to: 1, headSeq: 1, minSeq: 1, live: true, records: [] });
+      expect(await p.type("snapshotRequired")).toMatchObject({ reason: "epoch", epoch: 2 });
+      const up = await a.commit([putOp(fileId(), null, pathKey())]);
+      expect((up.results[0] as { seqs: number[] }).seqs[0]).toBe(2);
+      expect(a.frames.some((x) => x.type === "snapshotRequired")).toBe(false);
+      a.close(); p.close();
+    } finally {
+      await ls.close();
+      await removeDir(ldir);
+    }
+  });
+
+  it("rebuild: a pre-rebuild cid is neither replayed nor re-run (SNAPSHOT_REQUIRED); cursors keep acked_seq", async () => {
+    const v = await createVault(srv, c, "rebuild-cid");
+    const phone = await login(srv, "alice", "phone-cid");
+    const fid = fileId(), pk = pathKey();
+    const op = putOp(fid, null, pk);
+    const first = await api(srv, phone, "POST", `/v1/vaults/${v}/commit`, { cid: "6f9619ff-8b86-4011-b42d-00cf4fc964ff", ops: [op] });
+    expect(first.status).toBe(200);
+    const b = await TestWs.open(srv);
+    b.autoAck = true;
+    await b.connect(phone.token, v, { since: 0 });
+    for (let i = 0; i < 100 && !srv.core.s.get("SELECT 1 AS x FROM device_cursors WHERE vault_id = ?", v); i++) await new Promise((r) => setTimeout(r, 10));
+    expect((await api(srv, c, "POST", `/v1/vaults/${v}/rebuild`, { info: makeInfo(v, { epoch: 2, infoRev: 2 }) })).status).toBe(200);
+    const again = await api(srv, phone, "POST", `/v1/vaults/${v}/commit`, { cid: "6f9619ff-8b86-4011-b42d-00cf4fc964ff", ops: [op] });
+    expect(again.json.error).toMatchObject({ code: "SNAPSHOT_REQUIRED", details: { reason: "epoch", epoch: 2, minSeq: 1, rollbackAt: null } });
+    // Nothing was written by the refused resend.
+    const snap = await api(srv, c, "GET", `/v1/vaults/${v}/snapshot`);
+    expect(snap.json.records).toEqual([]);
+    expect(srv.core.store.vault(v)!.head_seq).toBe(1);
+    // A second rebuild keeps the original marker; a fresh cid with the same op is a normal create.
+    expect((await api(srv, c, "POST", `/v1/vaults/${v}/rebuild`, { info: makeInfo(v, { epoch: 3, infoRev: 3 }) })).status).toBe(200);
+    const row = srv.core.s.get<{ result_json: string }>("SELECT result_json FROM commits WHERE vault_id = ? AND cid = ?", v, "6f9619ff-8b86-4011-b42d-00cf4fc964ff");
+    expect(JSON.parse(row!.result_json)).toEqual({ staleEpoch: 1 });
+    const fresh = await api(srv, phone, "POST", `/v1/vaults/${v}/commit`, { cid: "7f9619ff-8b86-4011-b42d-00cf4fc964ff", ops: [op] });
+    expect(fresh.json.results[0]).toMatchObject({ ok: true, seqs: [2] });
+    const cur = srv.core.s.get<{ acked_seq: number; rollback_ack: number | null }>(
+      "SELECT acked_seq, rollback_ack FROM device_cursors WHERE vault_id = ? AND device_id = ?", v, phone.deviceId);
+    expect(cur).toMatchObject({ acked_seq: 1, rollback_ack: null });
+    b.close();
   });
 
   it("delete needs owner and X-Shuttle-Confirm; sockets close 4404; member access is FORBIDDEN", async () => {

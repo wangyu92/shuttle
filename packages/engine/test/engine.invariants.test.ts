@@ -20,6 +20,9 @@ async function pair(seed: string, o: { a?: ConstructorParameters<typeof Node>[1]
   const b = new Node(w, o.b ?? { name: "beta" });
   await a.start();
   await b.start();
+  // Both devices finish their first bootstrap (hello since = null, design §2.9.1) before the property
+  // runs, so its first "sync" step is an ordinary incremental pass.
+  await syncAll([a, b]);
   return { w, a, b };
 }
 

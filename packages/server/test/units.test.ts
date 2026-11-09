@@ -4,6 +4,7 @@ import { FailureLimiter, TokenBuckets, enrollCodeHash, hashPassword, newDeviceTo
 import { optionsFromEnv, resolveConfig } from "../src/config";
 import { etagMatches } from "../src/server-core";
 import { b64uDecodeStrict } from "../src/util";
+import { clientIp } from "../src/rest";
 import { FAST_SCRYPT, TestWs, cid, fileId, fixture, login, pathKey, putOp, removeDir, start, tempDir } from "./helpers";
 
 describe("auth helpers", () => {
@@ -121,5 +122,18 @@ describe("group commit", () => {
       await srv.close();
       await removeDir(dir);
     }
+  });
+});
+
+describe("clientIp (design §2.8.4 per-IP limits behind one proxy)", () => {
+  const req = (xff: string | string[] | undefined) => ({ headers: xff === undefined ? {} : { "x-forwarded-for": xff }, socket: { remoteAddress: "127.0.0.1" } }) as unknown as import("node:http").IncomingMessage;
+  it("takes the rightmost X-Forwarded-For entry, the one the proxy appended", () => {
+    expect(clientIp(req("10.0.7.1, 127.0.0.2"), true)).toBe("127.0.0.2");
+    expect(clientIp(req(["10.0.7.1", "127.0.0.2"]), true)).toBe("127.0.0.2");
+    expect(clientIp(req("127.0.0.3"), true)).toBe("127.0.0.3");
+  });
+  it("ignores the header without trustProxy", () => {
+    expect(clientIp(req("10.0.7.1, 127.0.0.2"), false)).toBe("127.0.0.1");
+    expect(clientIp(req(undefined), true)).toBe("127.0.0.1");
   });
 });

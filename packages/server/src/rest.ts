@@ -14,7 +14,7 @@ import {
 } from "@shuttle/protocol";
 import type {
   AuthResponse, ChangesResponse, CreateVaultResponse, DeviceDescriptor, DeviceInfo, EnrollCodeResponse, ErrorBody,
-  HealthResponse, MeResponse, PackEntry, SnapshotReason, SnapshotResponse, UserInfo, Validation, VaultSummary, WelcomeLimits,
+  HealthResponse, MeResponse, PackEntry, SnapshotReason, SnapshotResponse, UserInfo, Validation, VaultSummary,
 } from "@shuttle/protocol";
 import { enrollCodeHash, newEnrollCode, normalizeEnrollCode, verifyPassword } from "./auth";
 import { looksSealed } from "./blobs";
@@ -33,11 +33,17 @@ interface Ctx {
 
 interface Authed { device: DeviceRow; user: UserRow }
 
+/**
+ * Client address for the per-IP limits (design §2.8.4). Behind one trusted proxy (DSM nginx with
+ * $proxy_add_x_forwarded_for) the proxy APPENDS the address it saw, so only the rightmost entry is
+ * trustworthy; the entries before it are whatever the client sent.
+ */
 export function clientIp(req: IncomingMessage, trustProxy: boolean): string {
   if (trustProxy) {
     const xff = req.headers["x-forwarded-for"];
-    const first = (Array.isArray(xff) ? xff[0] : xff)?.split(",")[0]?.trim();
-    if (first) return first;
+    const joined = Array.isArray(xff) ? xff.join(",") : xff;
+    const last = joined?.split(",").map((x) => x.trim()).filter((x) => x !== "").pop();
+    if (last) return last;
   }
   return req.socket.remoteAddress ?? "unknown";
 }
@@ -157,8 +163,8 @@ async function route(srv: Server, c: Ctx): Promise<void> {
   const m = c.method;
   if (a === "health" && seg.length === 2) {
     if (m !== "GET") methodNotAllowed();
-    // `limits` is additive (not yet in the protocol's HealthResponse): adapters learn them before subscribe.
-    const body: HealthResponse & { limits: WelcomeLimits } = {
+    // `limits` (additive): adapters learn them before subscribe, so REST commits respect them.
+    const body: HealthResponse = {
       ok: true, server: srv.version, protocols: [...SUPPORTED_PROTOCOLS], time: Date.now(), source: srv.cfg.sourceUrl,
       limits: { ...srv.cfg.limits },
     };
@@ -177,7 +183,7 @@ async function route(srv: Server, c: Ctx): Promise<void> {
   const au = authenticate(srv, c);
   if (a === "me" && seg.length === 2) {
     if (m !== "GET") methodNotAllowed();
-    const body: MeResponse & { limits: WelcomeLimits } = {
+    const body: MeResponse = {
       user: userInfo(au.user), device: deviceInfo(au.device, au.device.device_id), limits: { ...srv.cfg.limits },
     };
     return sendJson(c.res, 200, body);
@@ -217,7 +223,7 @@ async function route(srv: Server, c: Ctx): Promise<void> {
         if (m !== "POST") methodNotAllowed();
         requireOwner(srv, v, au);
         const { value } = await readJson(srv, c.req, validateRebuildRequest);
-        return sendJson(c.res, 200, srv.rebuild(v, value.info));
+        return sendJson(c.res, 200, srv.rebuild(v, value.info, au.device.device_id));
       } break;
       case "usage": if (seg.length === 4) {
         if (m !== "GET") methodNotAllowed();

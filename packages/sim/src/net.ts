@@ -61,11 +61,13 @@ export class SimNet implements RemoteAdapter {
   }
 
   /**
-   * Server restored from a backup (design §2.6.1): while set, every subscribe answers
-   * snapshotRequired{reason:'rollback'} instead of opening the feed. Cleared when the device accepts
-   * (the stand-in for hello.rollbackAck, which the fake server does not model).
+   * Server restored from a backup (design §2.6.1): while set, every subscribe whose hello does not
+   * carry `rollbackAck === rollbackAt` answers snapshotRequired{reason:'rollback'} instead of opening
+   * the feed. A matching ack is stored for this device (`device_cursors.rollback_ack`) and clears it.
    */
   rollbackAt: number | null = null;
+  /** The hello fields the engine supplies (ServerAdapter `session` option; engine.helloContext()). */
+  session: (() => { rollbackAck: number | null }) | null = null;
 
   /** Point this proxy at another server (the DB-restore fault builds a new server object). */
   rebind(server: FakeRemoteServer, rollbackAt: number | null = null): void {
@@ -190,6 +192,7 @@ export class SimNet implements RemoteAdapter {
       this.server.later(() => { if (!closed) sink.onState("offline", "sim offline"); });
       return { close: () => { closed = true; }, nudge: () => undefined };
     }
+    if (this.rollbackAt !== null && this.session?.().rollbackAck === this.rollbackAt) this.rollbackAt = null;
     if (this.rollbackAt !== null) {
       const info = { reason: "rollback" as const, minSeq: this.server.minSeq, epoch: this.server.epoch, rollbackAt: this.rollbackAt };
       let closed = false;

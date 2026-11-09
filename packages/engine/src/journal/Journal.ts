@@ -9,6 +9,9 @@
 //    kept separately from the put/delete slot so a later edit can never replace (and lose) an archive.
 //  - An op with `source: 'staging'` carries its plaintext in `staging[opSeq]` from the moment it is
 //    enqueued (archive bytes, X1 re-upload of the base): the file on disk may change right after.
+//  - A staged put op (D1 merge write, X1) is never replaced in place or dropped before its ack: its
+//    bytes can be the only copy of a local edit (torn merge write). A newer change, a CONFLICT or a
+//    failed blob repair turns it into an archive op instead (I6).
 //
 // Every write here is one StateStore transaction; enqueueIn() runs inside a caller's transaction
 // (PUSH_CREATE creates the FileEntry and its op together, design §3.7.1).
@@ -61,6 +64,11 @@ function keepsOp(cur: Op, req: EnqueueReq): boolean {
   return cur.state === "queued" || (req.hash !== undefined && req.hash === cur.contentHash);
 }
 
+/** A put op whose plaintext lives in staging (merge write D1, X1 base re-upload). */
+export function isStagedPut(op: Op): boolean {
+  return op.kind === "put" && op.source === "staging";
+}
+
 export function isFrozenOp(op: Op): boolean {
   return op.state === "sent";
 }
@@ -90,7 +98,12 @@ export class Journal {
       const cur = await Journal.slotOp(tx, req.fileId);
       if (cur && isFrozenOp(cur)) return { t: "waiting" };
       if (cur && keepsOp(cur, req)) return { t: "replaced", opSeq: cur.opSeq };
-      if (cur) {
+      if (cur && isStagedPut(cur) && cur.base !== null) {
+        // A staged put (D1 merge, X1 base re-upload) holds bytes that may exist nowhere else: a torn or
+        // interrupted merge write leaves only a prefix on disk. It is never replaced in place: it becomes
+        // an archive record (history, never moves the head) and the new change gets a fresh op (I6).
+        await Journal.archiveStagedIn(tx, cur);
+      } else if (cur) {
         const next: Op = {
           opSeq: cur.opSeq, kind: req.kind, fileId: req.fileId, path: req.path, base: req.base,
           state: "queued", attempts: 0, nextAttemptAt: 0, createdAt: cur.createdAt,
@@ -137,9 +150,23 @@ export class Journal {
     });
   }
 
+  /**
+   * Turn a non-frozen staged put op into an archive op in place (same opSeq, staging row kept), so its
+   * bytes reach the remote history instead of being dropped (I6). The caller checked `base !== null`.
+   */
+  static async archiveStagedIn(tx: StateTx, cur: Op): Promise<void> {
+    const { batchId: _b, lastError: _e, ...rest } = cur;
+    await tx.journal.put({ ...rest, kind: "archive", state: "queued", attempts: 0, nextAttemptAt: 0 });
+  }
+
   static async cancelIn(tx: StateTx, fileId: FileId): Promise<boolean> {
     const cur = await Journal.slotOp(tx, fileId);
     if (!cur || isFrozenOp(cur)) return false;
+    if (isStagedPut(cur) && cur.base !== null) {
+      // Never drop staged bytes (a torn merge write may have left no other copy): archive them (I6).
+      await Journal.archiveStagedIn(tx, cur);
+      return true;
+    }
     await tx.journal.delete(cur.opSeq);
     await tx.staging.delete(cur.opSeq);
     return true;

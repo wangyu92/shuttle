@@ -22,7 +22,7 @@ export function headerOf(rec: VersionRecord): RecordHeader {
 /** Header for opening a stored head's inline body or for re-checking it. */
 export function headerOfHead(h: RemoteHead, rcFallback: RetentionClass): RecordHeader {
   return {
-    fileId: h.fileId, kv: h.kv, kind: h.deleted ? "del" : "put", base: h.base, rc: h.rc ?? rcFallback, blobs: [...h.blobs], pathKey: h.pathKey,
+    fileId: h.fileId, kv: h.kv, kind: h.deleted ? "del" : h.archive === true ? "archive" : "put", base: h.base, rc: h.rc ?? rcFallback, blobs: [...h.blobs], pathKey: h.pathKey,
   };
 }
 
@@ -40,9 +40,23 @@ export function putMeta(i: PutMetaInput): FileMeta {
   };
 }
 
-/** Tombstone meta carries only {v, path, type, cat} (ID-8). */
-export function tombstoneMeta(path: string, cat: ConfigCategory | null): TombstoneMeta {
-  return { v: 1, path, type: "file", cat };
+/**
+ * Tombstone meta field set on deletes the sender's user approved through the `massDeleteLocal` guard
+ * (design §3.13). The receiver applies such a burst without asking again (one answer per burst for an
+ * unattended pair). An unknown meta field, preserved and ignored by older readers (design §2.4).
+ */
+export const APPROVED_DELETE_FIELD = "approved";
+
+/** Tombstone meta carries only {v, path, type, cat} (ID-8), plus `approved` on a guarded burst. */
+export function tombstoneMeta(path: string, cat: ConfigCategory | null, approved = false): TombstoneMeta {
+  const m: TombstoneMeta = { v: 1, path, type: "file", cat };
+  if (approved) m[APPROVED_DELETE_FIELD] = true;
+  return m;
+}
+
+/** The decoded tombstone carries the sender's guard approval. */
+export function isApprovedTombstone(meta: Record<string, unknown>): boolean {
+  return meta[APPROVED_DELETE_FIELD] === true;
 }
 
 export interface DecodedRecord {
@@ -57,7 +71,7 @@ export interface DecodedRecord {
  * reassembly, runs in BlobPipeline.download). Throws IntegrityError on any failure; the caller
  * quarantines (design §4.14). The Keyring logs a pathKey consistency warning itself.
  */
-export async function decodeRecord(ring: Keyring, rec: VersionRecord): Promise<DecodedRecord> {
+export async function decodeRecord(ring: Keyring, rec: VersionRecord, opts: { archiveAsHead?: boolean } = {}): Promise<DecodedRecord> {
   let meta: Record<string, unknown>;
   try {
     meta = await ring.openMeta(rec.meta, headerOf(rec));
@@ -80,14 +94,14 @@ export async function decodeRecord(ring: Keyring, rec: VersionRecord): Promise<D
   if (hasInline && rec.blobs.length > 0) throw new IntegrityError(`record ${rec.seq}: inline and blobs`, "meta");
   if (!hasInline && rec.blobs.length !== m.chunks.length) throw new IntegrityError(`record ${rec.seq}: blob list does not match chunks`, "meta");
   if (!hasInline && m.size > 0 && rec.blobs.length === 0) throw new IntegrityError(`record ${rec.seq}: no content`, "meta");
-  if (rec.kind === "archive") return { rec, meta, head: null };
-  return {
-    rec, meta,
-    head: baseHead(rec, path, {
-      deleted: false, size: m.size, mtime: m.mtime, ctime: m.ctime, contentHash: m.hash,
-      chunkSizes: hasInline ? [] : [...m.chunks], z: m.z, p: m.p,
-    }),
-  };
+  // An archive record is history, never a head; `archiveAsHead` reads its content (torn-write check).
+  if (rec.kind === "archive" && opts.archiveAsHead !== true) return { rec, meta, head: null };
+  const head = baseHead(rec, path, {
+    deleted: false, size: m.size, mtime: m.mtime, ctime: m.ctime, contentHash: m.hash,
+    chunkSizes: hasInline ? [] : [...m.chunks], z: m.z, p: m.p,
+  });
+  if (rec.kind === "archive") head.archive = true;
+  return { rec, meta, head };
 }
 
 function baseHead(

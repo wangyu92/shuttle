@@ -7,7 +7,7 @@ import type {
   Clock, DebugInfo, DeviceSettings, Disposable, EngineStatus, GuardChoice, GuardEvent, HttpClient, Keyring, LocalFs, LogEntry,
   StateStore, VaultInfo, WsFactory,
 } from "@shuttle/protocol";
-import { ServerAdapter } from "@shuttle/adapter-server";
+import { ServerAdapter, helloSession } from "@shuttle/adapter-server";
 import { SxKeyring, fromB64u, fromCache, isCryptoError, type CachedSecrets, type VaultInfo as CryptoVaultInfo } from "@shuttle/crypto";
 import { ENGINE_VERSION, createEngine, type ShuttleEngine } from "@shuttle/engine";
 import { PLUGIN_ID, PLUGIN_VERSION, STARTUP_INFO_TIMEOUT_MS } from "../constants";
@@ -161,6 +161,8 @@ export class Session {
       http: d.http, ws: d.ws, clock: d.clock, scheduler: d.scheduler,
       client: { name: settings.deviceName ?? d.defaultDeviceName, platform: d.platformName, version: PLUGIN_VERSION, role: "plugin" },
       state: adapterStateStoreOver(state), allowHttp: profile.allowHttp,
+      // design §2.6.1: hello seenMaxSeq / rollbackAck come from the engine (the epoch stays the adapter's).
+      session: () => helloSession(this.engine?.helloContext() ?? null),
     });
     const seenStore = d.store.seenStore(profile.vaultId);
     const k = await keyringFromCache(d.store.keys(profile.vaultId), async () => (await adapter.getVaultInfo())?.info ?? null, {

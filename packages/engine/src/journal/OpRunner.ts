@@ -33,7 +33,7 @@ import type { DirtyKey, DirtyReason } from "../types";
 import { utf8Encode } from "../util/bytes";
 import type { KeyedMutex } from "../util/KeyedMutex";
 import { uuidV4 } from "../util/uuid";
-import { Journal } from "./Journal";
+import { Journal, isStagedPut } from "./Journal";
 import { backoffDelay } from "./backoff";
 
 /** Encoded-size reserve below maxCommitBytes (design §3.7.2, XS-24). */
@@ -77,6 +77,8 @@ export interface OpRunnerDeps {
   onSnapshotRequired?(): void;
   /** X5: an archive op failed for good; its staged bytes must survive as a conflict copy. */
   onArchiveFailed?(op: Op, bytes: Uint8Array): Promise<void>;
+  /** design §3.13: this delete was approved by the user through the massDeleteLocal guard. */
+  deleteApproved?(fileId: FileId): boolean;
 }
 
 export interface RunStats { prepared: number; uploaded: number; sent: number; acked: number; conflicts: number; failed: number; requeued: number }
@@ -391,7 +393,7 @@ export class OpRunner {
       if (op.kind === "delete") {
         if (op.base === null) throw new Error(`delete op ${op.opSeq} without base`);
         const h = { fileId: op.fileId, kv: batch.kv, kind: "del" as const, base: op.base, rc, blobs: [], pathKey };
-        out.push({ op: "del", fileId: op.fileId, base: op.base, pathKey, rc, kv: batch.kv, meta: await ring.sealMeta({ ...tombstoneMeta(op.path, cat) }, h) });
+        out.push({ op: "del", fileId: op.fileId, base: op.base, pathKey, rc, kv: batch.kv, meta: await ring.sealMeta({ ...tombstoneMeta(op.path, cat, this.d.deleteApproved?.(op.fileId) === true) }, h) });
         continue;
       }
       const kind = op.kind === "archive" ? "archive" as const : "put" as const;
@@ -583,7 +585,9 @@ export class OpRunner {
         s.requeued++;
       } else if (r.code === "MISSING_BLOB") {
         // Repair failed (content changed or still missing): this op is abandoned; re-plan the file.
-        if (await this.finishOp(batch, op, null)) this.d.journal.unmirror(op.fileId);
+        // A staged put keeps its bytes as an archive op (I6: they may exist nowhere else).
+        if (isStagedPut(op) && op.base !== null) await this.archiveStaged(batch, op, null);
+        else if (await this.finishOp(batch, op, null)) this.d.journal.unmirror(op.fileId);
         this.redirty(op, "retry");
         s.requeued++;
       } else {
@@ -617,6 +621,30 @@ export class OpRunner {
         await tx.journal.delete(op.opSeq);
         await tx.staging.delete(op.opSeq);
         await dropBatchIfEmpty(tx, batch.batchId);
+        return true;
+      });
+    } finally {
+      unlock();
+    }
+  }
+
+  /**
+   * A staged put (D1 merge, X1) leaves its batch without an ack: it becomes an archive op (same opSeq,
+   * staging kept) instead of being deleted, so a torn merge write never loses the merged local edit
+   * (I6). `more` runs in the same transaction (conflict bookkeeping).
+   */
+  private async archiveStaged(batch: Batch, op: Op, more: ((w: IndexWriter, tx: StateTx) => Promise<void>) | null): Promise<boolean> {
+    const e = this.d.index.byFileId(op.fileId);
+    const unlock = await this.d.locks.acquire(...lockKeys(op.fileId, op.path, e?.path));
+    try {
+      return await this.d.index.write(["journal", "staging", "batches", "applyQueue"], async (w) => {
+        const tx = w.tx;
+        const cur = await tx.journal.get(op.opSeq);
+        if (!cur || cur.batchId !== batch.batchId) return false;
+        if (more) await more(w, tx);
+        await Journal.archiveStagedIn(tx, cur);
+        await dropBatchIfEmpty(tx, batch.batchId);
+        this.d.log?.({ key: "log.stagedArchived", cat: "merge", path: op.path, fileId: op.fileId });
         return true;
       });
     } finally {
@@ -736,11 +764,19 @@ export class OpRunner {
     // A delete whose head is already a tombstone is done (design §2.5 "the engine treats it as done").
     const deleteDone = op.kind === "delete" && code === "CONFLICT" && current?.kind === "del" && head !== null;
     let freedPath: string | null = null;
-    const done = await this.finishOp(batch, op, async (w, tx) => {
+    const keep = isStagedPut(op) && op.base !== null;
+    const done = await (keep ? this.archiveStaged.bind(this) : this.finishOp.bind(this))(batch, op, async (w, tx) => {
       // A head learned from the result is mirrored AND queued for apply, exactly like ingest: when the
       // feed later delivers the same record it is "already known" and would not be queued again.
       if (head && (head.fileId === op.fileId || code === "PATH_TAKEN") && (await w.upsertRemote(head))) {
         await tx.applyQueue.put({ fileId: head.fileId, seq: head.seq, enqueuedAt: this.d.now(), attempts: 0 });
+      }
+      if (code === "CONFLICT" && current === null && op.base !== null && w.remote(op.fileId)?.deleted) {
+        // The server holds no head for this fileId any more: the mirrored tombstone was purged. Without
+        // it the Planner sees "R absent" (S8/C5 through a resync) instead of resurrecting against the
+        // same stale base forever. A stale LIVE head is left alone: that is an epoch change, which
+        // the epoch resync resolves (a user delete is never turned into a forget here).
+        await w.deleteRemote(op.fileId);
       }
       if (deleteDone) {
         const e = w.entry(op.fileId);

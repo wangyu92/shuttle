@@ -5,12 +5,12 @@
 
 import {
   DEFAULT_LIMITS, MAX_MISSING_IDS, MAX_PACK_ENTRIES, PACK_CONTENT_TYPE, SNAPSHOT_PAGE_DEFAULT, SNAPSHOT_PAGE_MAX,
-  CHANGES_LIMIT_DEFAULT, HEADER_SHA256, decodePack, encodePack, isRemoteError, remoteError,
+  CHANGES_LIMIT_DEFAULT, HEADER_SHA256, checkCommitLimits, decodePack, encodePack, isRemoteError, remoteError,
   validateAuthResponse, validateChangesResponse, validateCommitResponse, validateCreateVaultResponse,
   validateDevicesResponse, validateEnrollCodeResponse, validateMeResponse, validateMissingBlobsResponse,
   validatePackPutResponse, validatePutInfoResponse, validateRebuildResponse, validateSnapshotRequiredDetails,
   validateSnapshotResponse, validateUsageResponse, validateVaultInfo, validateVersionRecord, validateVersionsResponse,
-  PackError,
+  PackError, utf8Length,
 } from "@shuttle/protocol";
 import type {
   AdapterDevice, AdapterStateStore, AuthResponse, BlobId, ChangeBatch, ChangeSink, ClientRole, Clock, CommitRequest,
@@ -152,6 +152,11 @@ export class ServerAdapter implements RemoteAdapter {
     const { data: meData } = await this.rest.json("GET", "/me", "me");
     const me = need(validateMeResponse(meData), "me");
     this.deviceId = me.device.deviceId;
+    // Server limits before any subscribe (a welcome refreshes them): REST commits and the engine's batch
+    // sizes follow them from the start. /v1/me wins over the probe's /v1/health; a server sending
+    // neither keeps the protocol defaults.
+    const limits = me.limits ?? this.rest.lastHealth?.limits;
+    if (limits) this.caps = serverCapabilities(limits);
     const serverTime = this.rest.lastHealth?.time;
     const info = await this.getVaultInfo();
     if (!info) {
@@ -298,6 +303,9 @@ export class ServerAdapter implements RemoteAdapter {
    */
   async commit(req: CommitRequest): Promise<CommitResponse> {
     if (this.feed.hasSubscription) return this.feed.commit(req);
+    // Same frame-level check as the socket path (design §2.5, §2.9.4), against the limits read at connect.
+    const tooBig = checkCommitLimits(req, utf8Length(JSON.stringify(req)), this.caps.limits);
+    if (tooBig) throw remoteError("TOO_LARGE", tooBig.message);
     const { data } = await this.rest.json("POST", `${this.vpath()}/commit`, "commit", req);
     const out = need(validateCommitResponse(data), "commit");
     if (out.cid !== req.cid || out.results.length !== req.ops.length) throw remoteError("PROTOCOL", "commit: response does not match the request");
@@ -309,6 +317,9 @@ export class ServerAdapter implements RemoteAdapter {
     const epoch = await this.knownEpoch();
     const q = new URLSearchParams({ since: String(since), limit: String(clampInt(limit ?? CHANGES_LIMIT_DEFAULT, 1, CHANGES_LIMIT_DEFAULT)) });
     if (epoch !== null) q.set("epoch", String(epoch));
+    // design §2.6.1: an accepted restore is acked on REST pulls too (the rollback resync's catch-up).
+    const s = this.o.session ? await this.o.session() : {};
+    if (s.rollbackAck !== undefined && s.rollbackAck !== null) q.set("rollbackAck", String(s.rollbackAck));
     const { data } = await this.rest.json("GET", `${this.vpath()}/changes?${q.toString()}`, "pull");
     const r = need(validateChangesResponse(data), "pull");
     if (r.from !== since) throw remoteError("PROTOCOL", `pull: asked from ${since}, got ${r.from}`);
@@ -531,4 +542,17 @@ function pick<T extends object, K extends keyof T>(o: Partial<T> | undefined, ke
   if (!o) return out;
   for (const k of keys) if (o[k] !== undefined) out[k] = o[k];
   return out;
+}
+
+/**
+ * Host helper for the `session` option: the engine's hello context (engine.helloContext()) reduced to
+ * the fields the adapter cannot know (design §2.6.1). The epoch stays the adapter's own; null fields
+ * fall back to the adapter's values.
+ */
+export function helloSession(c: { epoch: number | null; seenMaxSeq: Seq | null; rollbackAck: number | null } | null): Partial<HelloContext> {
+  if (!c) return {};
+  return {
+    ...(c.seenMaxSeq !== null ? { seenMaxSeq: c.seenMaxSeq } : {}),
+    ...(c.rollbackAck !== null ? { rollbackAck: c.rollbackAck } : {}),
+  };
 }

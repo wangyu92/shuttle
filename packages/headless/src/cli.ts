@@ -16,7 +16,7 @@ import { isRemoteError } from "@shuttle/protocol";
 import { ServerAdapter, RestClient, DEFAULT_REST_TIMEOUTS, fetchHttpClient, realScheduler as adapterScheduler, serverEnroll } from "@shuttle/adapter-server";
 import { DEFAULT_PLUGIN_ID, PathFilter, decodeRecord, nameRulesFor } from "@shuttle/engine";
 import { ConfigError, defaultConfig, deviceSettingsOf, loadConfig, validateConfig, type HeadlessConfig } from "./config";
-import { NodeLocalFs } from "./NodeLocalFs";
+import { NodeLocalFs, prepareTmpDir } from "./NodeLocalFs";
 import { SqliteStateStore } from "./state/SqliteStateStore";
 import {
   SECRETS_FORMAT, SecretsError, readSecrets, secretDir, secretsPath, writeFileAtomicSync, writeSecrets, type HeadlessSecrets,
@@ -103,7 +103,7 @@ export async function runCli(argv: string[], io: CliIo): Promise<number> {
   const [cmd, ...rest] = a.positionals;
   if (!cmd || a.values.help) {
     io.out(USAGE);
-    return cmd ? EXIT.ok : EXIT.error;
+    return a.values.help ? EXIT.ok : EXIT.error;
   }
   const stateDir = path.resolve(a.values.state ?? "/state");
   const ctx: Ctx = { a, io, stateDir, configFile: path.resolve(a.values.config ?? path.join(stateDir, "headless.json")), rest };
@@ -215,6 +215,15 @@ async function setup(ctx: Ctx): Promise<number> {
   checkPaths([vaultPath, tmpPath, ctx.stateDir], ctx.io.env);
   checkServerUrls(urls, ctx.io.env);
   if (v["create-vault"] && ctx.io.env["SHUTTLE_PROD"] === "1") throw new CliError("--create-vault is for sandboxes only (refused with SHUTTLE_PROD=1)", EXIT.error);
+  // The temp dir before the enroll code is spent (single use): a daemon refuses to start without it
+  // (design §6.1.3). push-only never writes into the vault and needs none.
+  if (v.mode !== "push-only") {
+    try {
+      prepareTmpDir(vaultPath, tmpPath);
+    } catch (e) {
+      throw new CliError(`setup: ${(e as Error).message}`, EXIT.startup);
+    }
+  }
   const allowHttp = v["allow-http"] === true || needHttp(urls);
   const pass = v["password-file"] ? readPasswordFile(v["password-file"]) : null;
   if (v["create-vault"] && pass === null) throw new CliError("--create-vault needs --password-file", EXIT.error);

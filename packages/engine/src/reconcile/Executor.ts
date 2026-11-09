@@ -231,6 +231,9 @@ export class Executor implements ActionExecutor {
     await this.crash("exec:removed");
     if (fileId) await d.index.forget(fileId);
     d.afterIndexChange?.();
+    // Another file's live head may hold this path (its pull was handed over while ours sat here).
+    const holder = d.index.remote.headForFoldKey(foldKey(path));
+    if (holder && !holder.deleted && holder.fileId !== fileId && !d.index.byFileId(holder.fileId)) d.markDirty({ path }, "remote");
   }
 
   /** Rename on disk and in the index. False (nothing changed) when `to` is occupied. */
@@ -513,12 +516,28 @@ export class Executor implements ActionExecutor {
     }
     const copy = await this.freeConflictPath(a.path);
     if (!(await this.localRename(a.fileId, L.path, copy))) return;
+    if (a.fileId && !d.index.remote.byFileId(a.fileId)) {
+      // The renamed file's own head is gone (an epoch re-create that lost its path, P1): its old base
+      // belongs to no head, so the copy is a plain new file now (pushed as a create, never an
+      // integrity error for a missing head).
+      const own = a.fileId;
+      await d.index.write([], async (w) => {
+        const cur = w.entry(own);
+        if (cur?.synced) {
+          await w.putEntry({ ...cur, synced: null, updatedAt: d.now() });
+          await w.tx.bases.delete(own);
+        }
+      });
+    }
     d.markDirty(a.fileId ? { fileId: a.fileId, path: copy } : { path: copy }, "conflict");
     if (!a.log) d.log?.({ key: "log.mergeConflict", cat: "merge", params: { copy }, path: a.path });
     if (a.pull) {
+      // Not a planned apply: the Planner decided about the local file it renamed away, not about the
+      // pulled file's own local copy (it may live elsewhere with the user's edits): the applier's own
+      // checks hand that one to the Planner instead of overwriting it (I6).
       const R = d.index.remote.byFileId(a.pull.fileId);
       const target = R && a.pull.path !== R.path ? a.pull.path : undefined;
-      await d.applier.applyLocked(a.pull.fileId, { planned: true, ...(target !== undefined ? { targetPath: target } : {}) });
+      await d.applier.applyLocked(a.pull.fileId, target !== undefined ? { targetPath: target } : {});
     }
   }
 
@@ -604,6 +623,15 @@ export class Executor implements ActionExecutor {
       if (ic?.c === "pre") {
         await d.journal.cancel(a.fileId);
         await d.intents.delete(path);
+      } else if (ic?.c === "foreign" || ic?.c === "absent") {
+        // Torn in this session: rewrite the staged merge right away (D1). Until the disk holds it, the
+        // merged local edit lives only in the state store, which a store eviction would take with it.
+        const r = await d.intents.recoverMerge(path, (b, hh) => d.echo.expect(path, { hash: hh, size: b.length })).catch(() => null);
+        if (r === "restored" || r === "done") {
+          d.log?.({ key: "log.tornMergeRestored", cat: "merge", path, fileId: a.fileId });
+          d.markDirty({ fileId: a.fileId, path }, "retry");
+          return true;
+        }
       }
       d.markDirty({ fileId: a.fileId, path }, "retry");
       throw err;

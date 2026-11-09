@@ -30,7 +30,7 @@ import { getMeta, setMeta } from "../state/StateStore";
 import { crashPoint } from "../testing/crashPoint";
 import type { DirtyKey, DirtyReason, PlanMode } from "../types";
 import type { EngineHooks } from "@shuttle/protocol";
-import { decodeRecord } from "./records";
+import { decodeRecord, isApprovedTombstone } from "./records";
 
 export interface IngestDeps {
   index: FileIndex;
@@ -50,6 +50,8 @@ export interface IngestDeps {
   log?(e: { key: string; cat: 'error' | 'general'; params?: Record<string, string | number | boolean | null>; fileId?: FileId }): void;
   /** Retention class of a path, for heads stored before they carried `rc` (headOf fallback). */
   rcOf?(path: string): RetentionClass;
+  /** A tombstone the sender's user approved through its mass-delete guard (design §3.13). */
+  onApprovedDelete?(fileId: FileId, seq: Seq): void;
 }
 
 export interface Quarantined { rec: VersionRecord; reason: string; stage: string }
@@ -92,6 +94,7 @@ export class Ingest implements ChangeSink {
           hist.push(rec);
           continue;
         }
+        if (dec.head.deleted && isApprovedTombstone(dec.meta)) this.d.onApprovedDelete?.(rec.fileId, rec.seq);
         heads.set(rec.fileId, dec.head);
         raws.set(rec.fileId, rec);
       } catch (err) {
@@ -285,6 +288,7 @@ export class Ingest implements ChangeSink {
   private async decodeInto(ring: Keyring, rec: VersionRecord, map: Map<FileId, RemoteHead>, bad: Quarantined[], raws: Map<FileId, VersionRecord>): Promise<void> {
     try {
       const dec = await decodeRecord(ring, rec);
+      if (dec.head?.deleted && isApprovedTombstone(dec.meta)) this.d.onApprovedDelete?.(rec.fileId, rec.seq);
       if (dec.head) {
         const prev = map.get(rec.fileId);
         if (!prev || prev.seq < dec.head.seq) {

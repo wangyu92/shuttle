@@ -3,7 +3,7 @@ import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { CloseCode } from "@shuttle/protocol";
-import type { CommitRequest, SnapshotReason, VaultInfoEnvelope, VersionRecord } from "@shuttle/protocol";
+import type { CommitRequest, VaultInfoEnvelope, VersionRecord } from "@shuttle/protocol";
 import { FailureLimiter, TokenBuckets, newDeviceToken, tokenHash } from "./auth";
 import { BlobStore } from "./blobs";
 import type { ResolvedConfig } from "./config";
@@ -231,8 +231,12 @@ export class Server {
     return etag;
   }
 
-  /** design §2.11 step 3: new info + epoch atomically, drop history rows, keep head_seq. */
-  rebuild(v: VaultRow, info: VaultInfoEnvelope): { epoch: number; headSeq: number } {
+  /**
+   * design §2.11 step 3: new info + epoch atomically, drop history rows, keep head_seq. Step 5: only
+   * the OTHER devices get snapshotRequired{epoch}; the caller's own sockets adopt the new epoch and keep
+   * their feed so step 4's uploads go out on the same connection.
+   */
+  rebuild(v: VaultRow, info: VaultInfoEnvelope, callerDeviceId: string | null): { epoch: number; headSeq: number } {
     const out = txImmediate(this.db, () => {
       const cur = this.store.vault(v.vault_id);
       if (!cur) throw new HttpError("VAULT_NOT_FOUND");
@@ -242,12 +246,19 @@ export class Server {
       if (info.infoRev <= old.infoRev) throw new HttpError("INVALID", "infoRev did not increase");
       const json = JSON.stringify(info);
       const vid = cur.vault_id;
-      // design §2.11 step 3 drops versions, files, version_blobs and blob rows. `commits` and
-      // `device_cursors` go too (v1 is silent): a pre-rebuild cid must be re-evaluated against the new
-      // epoch, never answered `replayed:true` with seqs that no longer exist.
-      for (const t of ["version_blobs", "versions", "files", "blobs", "commits", "device_cursors"]) {
+      // design §2.11 step 3 drops versions, files, version_blobs and blob rows.
+      for (const t of ["version_blobs", "versions", "files", "blobs"]) {
         this.s.run(`DELETE FROM ${t} WHERE vault_id = ?`, vid);
       }
+      // v1 is silent on `commits` and `device_cursors`. Commits: the cid rows are kept but marked with
+      // the epoch they belong to, so a resend of a pre-rebuild cid is refused with SNAPSHOT_REQUIRED.
+      // It is neither answered `replayed:true` with seqs that no longer exist (the device would think
+      // its change is on the remote) nor re-run against the new epoch (a stale plan applied blindly).
+      this.s.run("UPDATE commits SET result_json = ? WHERE vault_id = ? AND result_json NOT LIKE '{\"staleEpoch\":%'",
+        JSON.stringify({ staleEpoch: cur.epoch }), vid);
+      // Cursors: seqs are monotonic and head_seq is kept, so acked_seq stays meaningful; the rollback
+      // rule ends with the rebuild (rollback_at is cleared below), so its acks go.
+      this.s.run("UPDATE device_cursors SET rollback_ack = NULL WHERE vault_id = ?", vid);
       this.s.run(
         `UPDATE vaults SET info_json = ?, info_etag = ?, epoch = ?, min_seq = head_seq, restored_seq = NULL, rollback_at = NULL
          WHERE vault_id = ?`, json, etagOf(json), info.epoch, vid);
@@ -258,13 +269,11 @@ export class Server {
     this.store.stored.drop(v.vault_id);
     this.hwm.mark(v.vault_id);
     void this.hwm.flushAll();
-    this.parkVault(v.vault_id, "epoch");
+    for (const c of this.hub.ofVault(v.vault_id)) {
+      if (callerDeviceId !== null && c.deviceId === callerDeviceId) c.adoptEpoch(out.epoch);
+      else c.park("epoch", null);
+    }
     return out;
-  }
-
-  /** Every socket of the vault gets snapshotRequired (rebuild: including the caller's own device). */
-  parkVault(vid: string, reason: SnapshotReason): void {
-    for (const c of this.hub.ofVault(vid)) c.park(reason, null);
   }
 
   softDeleteVault(v: VaultRow): void {

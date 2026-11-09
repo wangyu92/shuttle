@@ -3,10 +3,11 @@
 //   npm run sim -w @shuttle/sim -- --seed 123 --devices 3 --steps 500 --trace-dir <dir>
 //   npm run sim -w @shuttle/sim -- --seed 123 --devices 3 --steps 500 --shrink
 // Options: --seeds N (seeds first..first+N-1), --first S (default 1), --seed S (one seed),
+// --seed-list A,B,C (exactly these seeds),
 // --devices N or A..B (cycled over seeds), --steps N, --check-every N, --no-faults, --trace-dir DIR
 // (failing seeds write <dir>/<seed>.jsonl), --shrink, --json (one JSON line per seed), --no-excluded
 // (no device excludes a folder), --no-edit-while-down (user acts only on running devices),
-// --settle-restart (restarts finish catch-up before the next action), --ci (the vitest configuration), --weight action=N (repeatable; 0 disables an action).
+// --settle-restart (restarts finish catch-up before the next action), --ci (the vitest configuration = the default), --weight action=N (repeatable; 0 disables an action).
 // Exit code 1 when any seed fails.
 
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -15,10 +16,11 @@ import { ACTIONS, replayCommand, runSim, shrinkSteps, type SimOptions, type SimR
 interface Args {
   first: number; seeds: number; devices: [number, number]; steps: number; checkEvery: number; faults: boolean;
   traceDir: string | null; shrink: boolean; json: boolean; excluded: boolean; editWhileDown: boolean; settleRestart: boolean; ci: boolean; weights: Record<string, number>;
+  list: number[] | null;
 }
 
 function parse(argv: string[]): Args {
-  const a: Args = { first: 1, seeds: 1, devices: [3, 3], steps: 300, checkEvery: 100, faults: true, traceDir: null, shrink: false, json: false, excluded: true, editWhileDown: true, settleRestart: false, ci: false, weights: {} };
+  const a: Args = { first: 1, seeds: 1, devices: [3, 3], steps: 300, checkEvery: 100, faults: true, traceDir: null, shrink: false, json: false, excluded: true, editWhileDown: true, settleRestart: false, ci: false, weights: {}, list: null };
   const num = (v: string | undefined, name: string): number => {
     const n = Number(v);
     if (!Number.isSafeInteger(n) || n < 0) throw new Error(`${name} needs a non-negative integer, got ${v}`);
@@ -31,6 +33,7 @@ function parse(argv: string[]): Args {
       case "--seeds": a.seeds = num(v, k); i++; break;
       case "--first": a.first = num(v, k); i++; break;
       case "--seed": a.first = num(v, k); a.seeds = 1; i++; break;
+      case "--seed-list": a.list = (v ?? "").split(",").filter((x) => x !== "").map((x) => num(x, k)); a.seeds = a.list.length; i++; break;
       case "--devices": {
         const m = /^(\d+)(?:\.\.(\d+))?$/.exec(v ?? "");
         if (!m) throw new Error(`--devices needs N or A..B, got ${v}`);
@@ -47,9 +50,10 @@ function parse(argv: string[]): Args {
       case "--no-excluded": a.excluded = false; break;
       case "--no-edit-while-down": a.editWhileDown = false; break;
       case "--settle-restart": a.settleRestart = true; break;
-      // The configuration of the vitest set: no user edits on dead devices, restarts settle, no
-      // excluded folders (the open engine findings are covered by scripted tests).
-      case "--ci": a.editWhileDown = false; a.settleRestart = true; a.excluded = false; break;
+      // The configuration of the vitest set. It used to switch off user edits on dead devices,
+      // unsettled restarts and excluded folders to route around engine findings A and B; both are
+      // fixed (lead decisions D5, D6), so the vitest set now runs the full default configuration.
+      case "--ci": break;
       case "--weight": {
         // --weight action=N (repeatable): override one action weight, 0 disables it.
         const m = /^([A-Za-z]+)=(\d+(?:\.\d+)?)$/.exec(v ?? "");
@@ -76,7 +80,7 @@ async function main(): Promise<number> {
   let failed = 0;
   const times: number[] = [];
   for (let k = 0; k < a.seeds; k++) {
-    const seed = a.first + k;
+    const seed = a.list ? (a.list[k] as number) : a.first + k;
     const span = a.devices[1] - a.devices[0] + 1;
     const devices = a.devices[0] + (k % span);
     const o: SimOptions = {

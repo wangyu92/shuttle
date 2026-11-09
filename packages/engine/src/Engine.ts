@@ -25,6 +25,7 @@ import { readAndHash } from "./content/hash";
 import { WriteIntents } from "./apply/WriteIntents";
 import { RemoteApplier, type DrainStats } from "./apply/RemoteApplier";
 import { Ingest, type ResyncMode } from "./remote/ingest";
+import { decodeRecord } from "./remote/records";
 import { withRequestTimeouts } from "./remote/timeouts";
 import { Executor } from "./reconcile/Executor";
 import { Reconciler, type ActionExecutor, type ExecContext, type ReconcileSettings } from "./reconcile/Reconciler";
@@ -37,7 +38,7 @@ import { LocalEventQueue } from "./events/LocalEventQueue";
 import type { EventTimings } from "./events/timing";
 import { KeyedMutex } from "./util/KeyedMutex";
 import { uuidV4 } from "./util/uuid";
-import { readMeta, writeMeta } from "./state/StateStore";
+import { readMeta, writeMeta, type MetaValues } from "./state/StateStore";
 import { prepareState } from "./state/migrations";
 import { classifyStartup, mirrorPendingOp, unmirrorPendingOp, type LocalRecord, type PendingOpMirror, type StartupClass } from "./state/epoch";
 import { isConfigJson, kindOf, retentionClassOf } from "./merge/MergePolicy";
@@ -127,6 +128,11 @@ export interface EngineOptions {
   headless?: boolean;
   /** No timers and no automatic loop runs: the caller drives runOnce() (tests, headless `--once`). Default false. */
   manual?: boolean;
+  /**
+   * The host has `path` open in an editor (design §3.10.2, §3.8.4 S20): remote changes to such a note
+   * go through LocalFs.processText so the editor keeps cursor and undo. Absent: always atomic writes.
+   */
+  editorHasOpen?(path: string): boolean;
   /** design §3.7.4 per-request timeouts on the scheduler (default on; false only for adapters that time out themselves in tests). */
   requestTimeouts?: boolean;
 }
@@ -188,6 +194,12 @@ class MemSeenStore implements SeenStore {
   load(): Seen | null { return this.s ? { ...this.s } : null; }
   save(s: Seen): void { this.s = { ...s }; }
 }
+
+/**
+ * design §3.13 / §7.7: how long after the last delete of an approved burst further deletes are still
+ * covered by the user's "apply" (a slow `rm -r` or a watcher that reports in pieces). 클로드 제안(미승인).
+ */
+export const DELETE_BURST_GRACE_MS = 60_000;
 
 export function createEngine(deps: EngineDeps, opts: EngineOptions = {}): ShuttleEngine {
   return new ShuttleEngine(deps, opts);
@@ -252,6 +264,10 @@ export class ShuttleEngine implements Engine {
 
   private planCtx: PlanCtx = { mode: "incremental" };
   private pendingResync: ResyncMode | null = null;
+  /** `rollbackAt` of the server restore the feed reported (design §2.6.1); acked after the accept. */
+  private rollbackAt: number | null = null;
+  /** `hello.rollbackAck` (design §2.6.1): the accepted `rollbackAt`, persisted in `meta`. */
+  private rollbackAck: number | null = null;
   private rebuildPending = false;
   /** The pending epoch resync follows this device's own remote rebuild (no "rebuilt elsewhere" notice). */
   private ownRebuild = false;
@@ -266,6 +282,16 @@ export class ShuttleEngine implements Engine {
   private emptyOverride = false;
   private parkedDeletes = new Map<FileId, DirtyKey>();
   private approvedDeletes = new Set<FileId>();
+  /**
+   * design §3.13 / §7.7: one answer covers the whole burst. After "apply" on massDeleteLocal, deletes
+   * that keep arriving (watcher events of the same `rm -r`) pass while the burst continues: until
+   * this time, extended by every delete pushed under it.
+   */
+  private deleteBurstUntil = 0;
+  /** Deletes pushed under a massDeleteLocal approval: their tombstones carry `approved` (§3.13). */
+  private guardedDeletes = new Set<FileId>();
+  /** Tombstones (fileId:seq) the sender's user approved; the receiver does not ask again. */
+  private approvedRemoteDeletes = new Set<string>();
   private deletesThisIteration = 0;
   private deleteThreshold = 25;
   private conflictCopiesThisPass = 0;
@@ -356,10 +382,22 @@ export class ShuttleEngine implements Engine {
     await writeMeta(d.state, "deviceId", deviceId);
     if (this.startup === "evicted") {
       this.rebuildPending = true;
+      // The rebuild rules (never delete, S26; conflict-copy guard) apply from the first plan, also
+      // before the snapshot arrives (offline start), and the mode is visible as soon as it applies.
+      this.planCtx = { mode: "rebuild" };
       this.log.add({ cat: "general", key: "log.rebuildingIndex" });
     }
     const storedPaused = await readMeta(d.state, "paused");
     if (storedPaused === true) this.userPaused = true;
+    const ack = await readMeta(d.state, "rollbackAck");
+    this.rollbackAck = typeof ack === "number" ? ack : null;
+    // An unfinished snapshot/epoch/rebuild reconcile continues in its mode after a restart.
+    const storedCtx = await readMeta(d.state, "planCtx");
+    if (storedCtx) this.planCtx = { ...storedCtx };
+    // The rollback ack goes out at the start of the accepted rollback resync (design §2.6.1 deviation,
+    // see resync()): after a restart in that reconcile, run the replace-mode snapshot again (idempotent)
+    // so a crash before its commit never leaves the old mirror in place.
+    if (storedCtx?.mode === "snapshotResync" && storedCtx.rollbackAccepted === true) this.pendingResync = "rollback";
 
     await this.loadIndex();
     this.assemble(now);
@@ -367,8 +405,9 @@ export class ShuttleEngine implements Engine {
     // design §3.11: filter fingerprint
     const fp = await readMeta(d.state, "filterFingerprint");
     if (fp !== this.filter.fingerprint()) {
+      // The fingerprint is stored when the rescope finished (a crash in between re-runs it).
       if (fp !== undefined) this.rescopeDue = true;
-      await writeMeta(d.state, "filterFingerprint", this.filter.fingerprint());
+      else await writeMeta(d.state, "filterFingerprint", this.filter.fingerprint());
     }
 
     // design §3.14 startup: self-test, leftover intents, journal resume, unpushed local changes
@@ -382,6 +421,12 @@ export class ShuttleEngine implements Engine {
     this.torn = await this.intents.startupCheck();
     await this.runner.resume();
     markPendingLocalChanges(this.index, (k, r) => this.dirty.mark(k, r));
+    if (this.planCtx.mode !== "incremental") {
+      // An unfinished snapshot/epoch/rebuild reconcile: its dirty marks died with the process, so every
+      // entry is planned again in that mode (rows S8/C5/C6 need it; nothing else changes for a file
+      // whose head matches its base).
+      for (const e of this.index.all()) this.dirty.mark({ fileId: e.fileId, path: e.path }, "remote");
+    }
 
     this.fsSub = d.fs.onEvent((e: LocalEvent) => this.events.handle(e));
     if (!this.opts.manual) {
@@ -467,7 +512,9 @@ export class ShuttleEngine implements Engine {
     if (this.connected && this.connectInfo) {
       await this.acceptVaultInfo(info, this.connectInfo);
       if (!this.blocked() && this.ring !== null && !this.rebuildPending && this.pendingResync === null) {
-        const cursor = (await readMeta(this.deps.state, "cursor")) ?? 0;
+        // design §2.9.1: since is null before the first bootstrap (the server answers no-cursor, never
+        // epoch: a fresh device has seen no rebuild and must not trip the epoch guard).
+        const cursor = (await readMeta(this.deps.state, "cursor")) ?? null;
         this.subscribe(cursor);
       }
     } else {
@@ -556,7 +603,7 @@ export class ShuttleEngine implements Engine {
     const before = this.filter.fingerprint();
     this.filter = this.makeFilter();
     if (this.filter.fingerprint() !== before && this.started) {
-      await writeMeta(this.deps.state, "filterFingerprint", this.filter.fingerprint());
+      // Persisted by rescope() once the scope change is applied, so a crash before it re-runs it.
       this.rescopeDue = true;
       this.kick("settings");
     }
@@ -576,7 +623,10 @@ export class ShuttleEngine implements Engine {
     if (c.quarantined > 0) return { status: "error", ...base, reason: "integrity" };
     if (!this.started || !this.connected) return { status: "disconnected", ...base };
     if (this.ring === null) return { status: "paused", ...base, reason: "locked" };
-    const busy = this.running !== null || this.dirty.size > 0 || pendingUp > 0 || c.applyQueue > 0 || this.pendingResync !== null || this.catchingUp;
+    // push-only (design §3.17): records still enter the apply queue but are never applied, so a
+    // non-empty queue is the steady state there, not pending work.
+    const applyBusy = c.applyQueue > 0 && this.settings.mode !== "push-only";
+    const busy = this.running !== null || this.dirty.size > 0 || pendingUp > 0 || applyBusy || this.pendingResync !== null || this.catchingUp;
     return { status: busy ? "syncing" : "synced", ...base };
   }
 
@@ -598,6 +648,7 @@ export class ShuttleEngine implements Engine {
         if (c === "apply") {
           for (const [id2, key] of this.parkedDeletes) { this.approvedDeletes.add(id2); this.dirty.mark(key, "retry"); }
           this.parkedDeletes.clear();
+          this.deleteBurstUntil = this.deps.clock.now() + DELETE_BURST_GRACE_MS;
           unpause();
         } else this.pause();
         return;
@@ -691,8 +742,18 @@ export class ShuttleEngine implements Engine {
       const got = await r.getVaultInfo();
       if (!got) throw new Error("no vault-info on the remote");
       const next = await markRebuildInfo(ring, got.info);
-      const res = await r.rebuild(next);
-      this.log.add({ cat: "general", key: "log.rebuildRemote", params: { files: pre.files, epoch: res.epoch } });
+      let epoch: number;
+      try {
+        epoch = (await r.rebuild(next)).epoch;
+      } catch (e) {
+        // The answer can be lost after the server switched epochs (network fault on the response).
+        // The vault-info then is exactly the one this device sent: the rebuild is ours, adopt it;
+        // otherwise this device would keep committing into an epoch it never resynced (sim 597, 983).
+        const now = await r.getVaultInfo().catch(() => null);
+        if (!now || !sameVaultInfo(now.info, next)) throw e;
+        epoch = next.epoch;
+      }
+      this.log.add({ cat: "general", key: "log.rebuildRemote", params: { files: pre.files, epoch } });
       // The new epoch belongs to this device: seen moves forward (rollback reference reset: the old
       // maxSeq described the history we just replaced), the mirror is replaced by the epoch resync.
       const seen = this.seenStore.load();
@@ -709,6 +770,7 @@ export class ShuttleEngine implements Engine {
       this.pendingResync = "epoch";
       this.ownRebuild = true;
       this.planCtx = { mode: "epoch" };
+      await writeMeta(this.deps.state, "planCtx", { mode: "epoch" }).catch(() => undefined);
     } finally {
       this.running = null;
       done();
@@ -785,6 +847,44 @@ export class ShuttleEngine implements Engine {
       before = page.next;
     }
     return out;
+  }
+
+  /**
+   * D5: the retained remote version of `fileId` whose content hash is `hash` (newest first, bounded),
+   * for the torn-write prefix test after the head moved on. null when not retained or not listable.
+   */
+  private async versionWithHash(fileId: FileId, hash: string): Promise<RemoteHead | null> {
+    const r = this.remote;
+    const ring = this.ring;
+    if (!r.listVersions || !ring) return null;
+    let before: Seq | undefined;
+    for (let i = 0; i < 5; i++) {
+      const page = await r.listVersions(fileId, before === undefined ? { limit: 50 } : { before, limit: 50 });
+      for (const rec of page.records) {
+        // An archive record can hold the bytes too (a staged merge kept after a CONFLICT, Journal I6).
+        if (rec.kind !== "put" && rec.kind !== "archive") continue;
+        let h: RemoteHead | null = null;
+        try {
+          h = (await decodeRecord(ring, rec, { archiveAsHead: true })).head;
+        } catch {
+          continue;
+        }
+        if (h && h.contentHash === hash) return h;
+      }
+      if (page.next === null) break;
+      before = page.next;
+    }
+    return null;
+  }
+
+  /**
+   * Hello fields the adapter cannot know by itself (design §2.6.1, §2.9.1, §4.9.2): the host passes
+   * this as the server adapter's `session` callback. `rollbackAck` is the `rollbackAt` the user
+   * accepted once its snapshot reconcile finished, else null.
+   */
+  helloContext(): { epoch: number | null; seenMaxSeq: Seq | null; rollbackAck: number | null } {
+    const seen = this.seenStore?.load() ?? null;
+    return { epoch: seen?.epoch ?? null, seenMaxSeq: seen?.maxSeq ?? null, rollbackAck: this.rollbackAck };
   }
 
   deletedFiles(): RemoteHead[] {
@@ -932,7 +1032,12 @@ export class ShuttleEngine implements Engine {
       deleteMode: () => this.settings.deleteMode,
       keepFolder: (p) => p === cfg || this.settings.excludedFolders.some((f) => f === p),
       confirmMassDelete: (count) => this.confirmRemoteMassDelete(count),
+      deleteApproved: (fileId, seq) => this.approvedRemoteDeletes.has(`${fileId}:${seq}`),
       noteApplied: (p) => this.configSync.noteApplied(p),
+      // design §3.10.2 / §3.8.4: notes open in an editor are updated through processText (S20).
+      isText: (p) => kind(p) === "note",
+      ...(this.opts.editorHasOpen ? { editorHasOpen: this.opts.editorHasOpen } : {}),
+      targetHead: (fileId, hash) => this.versionWithHash(fileId, hash),
       log: this.toLog,
     });
     this.runner = new OpRunner({
@@ -941,7 +1046,12 @@ export class ShuttleEngine implements Engine {
       markDirty: this.markDirty, rcOf, kindOf: kind, needsBase: this.needsBase,
       categoryOf: (p) => this.filter.categoryOf(p),
       batchMaxOps: this.budgets.commitBatchOps, ...(this.opts.random ? { random: this.opts.random } : {}),
-      onAcked: (op) => {
+      deleteApproved: (fileId) => this.guardedDeletes.has(fileId),
+      onAcked: (op, seq) => {
+        // design §2.6.1: an acked seq counts as seen. A DB restore that lost it is a rollback even when
+        // the feed never delivered that seq back to this device (its cursor stayed at restored_seq).
+        this.noteAckedSeq(seq);
+        if (op.kind === "delete") this.guardedDeletes.delete(op.fileId);
         this.updateLocal((r) => (r.everSynced ? r : { ...r, everSynced: true }));
         if (op.kind !== "archive") this.conflictLoops.recordSuccess(op.fileId);
         void this.renames.retry();
@@ -954,6 +1064,10 @@ export class ShuttleEngine implements Engine {
     });
     this.ingest = new Ingest({
       index: this.index, keyring, remote: this.remote, now, ...(hooks ? { hooks } : {}), markDirty: this.markDirty,
+      onApprovedDelete: (fileId, seq) => {
+        if (this.approvedRemoteDeletes.size > 100_000) this.approvedRemoteDeletes.clear();
+        this.approvedRemoteDeletes.add(`${fileId}:${seq}`);
+      },
       onSeen: (maxSeq) => this.noteSeen(maxSeq),
       kick: () => this.kick("remote"),
       onSnapshotRequired: (info) => this.onSnapshotRequired(info),
@@ -985,6 +1099,10 @@ export class ShuttleEngine implements Engine {
       hooks: {
         isTorn: (p, st) => this.intents.isTorn(p, st),
         reapply: async (p) => { await this.applier.reapply(p); },
+        ownPullTarget: async (p, fileId, hash) => {
+          const i = await this.intents.get(p);
+          return !!i && i.fileId === fileId && i.targetHash === hash && (await this.intents.stagedMerge(i)) === null;
+        },
         acquireHash: (n) => this.budget.acquireHash(n),
         releaseHash: (n) => this.budget.releaseHash(n),
         renames: this.renames,
@@ -1059,7 +1177,9 @@ export class ShuttleEngine implements Engine {
         this.torn = [];
         for (const t of torn) {
           try {
-            await this.applier.applyOne(t.fileId, { planned: true, torn: t.path });
+            // D5: classify first (strict prefix of the target → torn; anything else is a user edit).
+            const out = await this.applier.reapplyAt(t.path, t.fileId);
+            if (out === "retry") this.torn.push(t);
           } catch (e) {
             if (!isRemoteError(e)) throw e;
             this.torn.push(t);
@@ -1090,6 +1210,7 @@ export class ShuttleEngine implements Engine {
       if (this.planCtx.mode !== "incremental" && this.dirty.size === 0 && this.parkedConflicts.size === 0) {
         this.planCtx = { mode: "incremental" };
         this.conflictCopiesThisPass = 0;
+        await writeMeta(this.deps.state, "planCtx", null);
       }
       if (this.blocked()) return res;
       if (this.connected && !this.vaultInfoPending) {
@@ -1227,8 +1348,14 @@ export class ShuttleEngine implements Engine {
   // ---------- outgoing mass delete (design §3.13 massDeleteLocal) ----------
 
   /** Pre-count the deletes this iteration would push; above the threshold park them and ask. */
+  private inDeleteBurst(): boolean {
+    return this.deps.clock.now() < this.deleteBurstUntil;
+  }
+
   private async precountDeletes(): Promise<boolean> {
     if (this.dirty.size <= this.deleteThreshold && this.parkedDeletes.size === 0) return true;
+    // The user already answered "apply" for this burst (design §3.13 / §7.7: one answer per burst).
+    if (this.inDeleteBurst() && this.parkedDeletes.size === 0) return true;
     const mode = this.effectiveMode();
     if (mode === "pull-only" || mode === "mirror-remote") return true;
     const cands: Array<{ fileId: FileId; key: DirtyKey; path: string }> = [];
@@ -1259,8 +1386,17 @@ export class ShuttleEngine implements Engine {
   }
 
   private allowPushDelete(fileId: FileId, path: string): boolean {
-    if (this.approvedDeletes.delete(fileId)) return true;
+    if (this.approvedDeletes.delete(fileId)) {
+      this.guardedDeletes.add(fileId);
+      return true;
+    }
     if (this.parkedDeletes.has(fileId) || this.guardPause === "emptyVault") return false;
+    if (this.inDeleteBurst()) {
+      // Watcher deletes still arriving from the approved burst: covered by the same answer.
+      this.deleteBurstUntil = this.deps.clock.now() + DELETE_BURST_GRACE_MS;
+      this.guardedDeletes.add(fileId);
+      return true;
+    }
     this.deletesThisIteration++;
     if (this.deletesThisIteration > this.deleteThreshold) {
       // Deletes the pre-count did not foresee (events during the pass): hold them and ask.
@@ -1311,6 +1447,15 @@ export class ShuttleEngine implements Engine {
     for (const e of [...this.index.all()]) {
       const sc = this.filter.scope(e.path, e.obs?.size);
       if (sc === e.scope) continue;
+      if (sc === "active" && !(await this.isFileAt(e.path))) {
+        // I12 / lead decision D6: re-inclusion never pushes a delete the user did not make in scope. The
+        // local copy vanished while out of scope (a remote move into the excluded folder, or a removal
+        // this device could not see as a sync action): forget the entry; the remote head, if live, is
+        // pulled back below like any unknown file. Its pending op goes too (as in Planner FORGET).
+        await this.journal.cancel(e.fileId);
+        await this.index.forget(e.fileId);
+        continue;
+      }
       await this.index.setScope(e.fileId, sc);
       if (sc === "active") this.dirty.mark({ fileId: e.fileId, path: e.path }, "scope");
     }
@@ -1330,19 +1475,40 @@ export class ShuttleEngine implements Engine {
       for (const R of [...this.index.remote.all()]) {
         if (R.deleted) continue;
         const e = w.entry(R.fileId);
-        if (e && e.synced?.version === R.seq) continue;
+        // An entry now out of scope whose head lives at an active path (a rename into the folder that
+        // was excluded before it was pushed): the head is pulled there, nothing is deleted (I12).
+        const strayed = e !== null && e.scope !== "active" && e.path !== R.path;
+        if (e && e.synced?.version === R.seq && !strayed) continue;
         if (this.filter.scope(R.path, R.size) !== "active") continue;
         if (await tx.applyQueue.get(R.fileId)) continue;
         await tx.applyQueue.put({ fileId: R.fileId, seq: R.seq, enqueuedAt: this.deps.clock.now(), attempts: 0 });
       }
     });
+    await writeMeta(this.deps.state, "filterFingerprint", this.filter.fingerprint());
     this.scanDue = "fast";
+  }
+
+  private async isFileAt(path: string): Promise<boolean> {
+    const st = await this.deps.fs.stat(path).catch(() => null);
+    return st !== null && st.kind === "file";
   }
 
   // ---------- snapshot resync / rebuild / rollback accept (design §3.8.6, §3.3.5) ----------
 
   private async resync(mode: ResyncMode): Promise<boolean> {
     this.closeSub();
+    // Persisted before the resync commits: a restart in the middle plans the rest in the same mode.
+    const ctx: NonNullable<MetaValues["planCtx"]> = mode === "rebuild" ? { mode: "rebuild" }
+      : mode === "rollback" ? { mode: "snapshotResync", rollbackAccepted: true } : { mode };
+    await writeMeta(this.deps.state, "planCtx", ctx);
+    if (mode === "rollback" && this.rollbackAt !== null && this.rollbackAck !== this.rollbackAt) {
+      // design §2.6.1: the user accepted the restore. The resync's own catch-up pull (since = the
+      // snapshot head, above restored_seq) must carry the ack or the server refuses it with
+      // snapshotRequired{rollback} forever. Safe to ack now: planCtx (persisted just above) makes a
+      // restart finish the same snapshot reconcile.
+      this.rollbackAck = this.rollbackAt;
+      await writeMeta(this.deps.state, "rollbackAck", this.rollbackAck);
+    }
     let res;
     try {
       res = await this.ingest.snapshotResync(mode);
@@ -1362,6 +1528,12 @@ export class ShuttleEngine implements Engine {
       this.planCtx = { mode: "snapshotResync", rollbackAccepted: true };
       const s = this.seenStore.load();
       if (s) this.seenStore.save({ ...s, maxSeq: res.cursor });
+      // design §2.6.1: the snapshot reconcile of the accepted restore is done: the next hello carries
+      // rollbackAck = rollbackAt so the server stops answering snapshotRequired{rollback} (no loop).
+      if (this.rollbackAt !== null) {
+        this.rollbackAck = this.rollbackAt;
+        await writeMeta(this.deps.state, "rollbackAck", this.rollbackAck);
+      }
       this.scanDue = "fast";
     } else {
       this.planCtx = { mode };
@@ -1371,6 +1543,12 @@ export class ShuttleEngine implements Engine {
         this.log.add({ cat: "general", key: LOG_KEYS.epoch, params: { count: res.changed.length + res.purged.length } });
         this.guards.raise("epoch", res.changed.length + res.purged.length, []);
       }
+    }
+    // Entries whose base has no remote head at all (an integrity error in incremental mode scheduled
+    // this resync, or a re-create lost its path): the resync marks only fileIds it saw, so plan these
+    // again in the resync mode (rows S8/C5/C6).
+    for (const e of this.index.all()) {
+      if (e.synced && e.scope === "active" && !this.index.remote.byFileId(e.fileId)) this.dirty.mark({ fileId: e.fileId, path: e.path }, "remote");
     }
     if (this.pendingResync === mode || mode === "rebuild") this.pendingResync = null;
     if (this.connectInfo) await writeMeta(this.deps.state, "remoteEpoch", this.connectInfo.epoch);
@@ -1432,7 +1610,9 @@ export class ShuttleEngine implements Engine {
       this.reconnectAttempts = 0;
       this.log.add({ cat: "network", key: LOG_KEYS.connected });
       if (this.ring !== null && !this.rebuildPending && this.pendingResync === null) {
-        const cursor = (await readMeta(this.deps.state, "cursor")) ?? 0;
+        // design §2.9.1: since is null before the first bootstrap (the server answers no-cursor, never
+        // epoch: a fresh device has seen no rebuild and must not trip the epoch guard).
+        const cursor = (await readMeta(this.deps.state, "cursor")) ?? null;
         this.subscribe(cursor);
       }
       this.kick("connected");
@@ -1534,7 +1714,7 @@ export class ShuttleEngine implements Engine {
     }
   }
 
-  private subscribe(cursor: Seq): void {
+  private subscribe(cursor: Seq | null): void {
     if (this.ring === null || this.blocked() || !this.connected && !this.connectInfo) return;
     this.closeSub();
     const gen = ++this.subGen;
@@ -1620,6 +1800,7 @@ export class ShuttleEngine implements Engine {
   private onSnapshotRequired(info: SnapshotRequiredInfo): void {
     this.closeSub();
     if (info.reason === "rollback") {
+      if (typeof info.rollbackAt === "number") this.rollbackAt = info.rollbackAt;
       const seen = this.seenStore.load();
       this.raiseRollback(seen?.maxSeq ?? 0, info.minSeq);
     } else if (info.reason === "epoch") {
@@ -1643,6 +1824,13 @@ export class ShuttleEngine implements Engine {
     } else {
       this.log.add({ cat: "network", key: "log.remoteError", level: "error", params: { code: err.code } });
     }
+  }
+
+  /** Fold a commit ack into seen.maxSeq (hello seenMaxSeq), without moving the feed cursor. */
+  private noteAckedSeq(seq: Seq): void {
+    const s = this.seenStore.load();
+    if (!s || seq <= s.maxSeq || !this.connectInfo || s.epoch !== this.connectInfo.epoch) return;
+    this.seenStore.save({ ...s, maxSeq: seq });
   }
 
   private noteSeen(maxSeq: Seq): void {
@@ -1808,6 +1996,11 @@ function sanitizeName(s: string): string {
 }
 
 /** design §4.11.5 markRebuild over the protocol Keyring: verify the current MAC, epoch+1, infoRev+1, new MAC. */
+/** The rebuild vault-info this device sent is the one on the remote (same epoch, revision and MAC). */
+function sameVaultInfo(a: VaultInfo, b: VaultInfo): boolean {
+  return a.epoch === b.epoch && a.infoRev === b.infoRev && a.infoMac === b.infoMac;
+}
+
 export async function markRebuildInfo(ring: Keyring, info: VaultInfo): Promise<VaultInfo> {
   if (!(await ring.verifyVaultInfo(info))) throw new Error("TamperedVaultInfo");
   const { infoMac: _m, ...rest } = info;

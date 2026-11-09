@@ -2,7 +2,7 @@
 export const PACKAGE_NAME = "@shuttle/adapter-server";
 
 export {
-  ServerAdapter, STATE_EPOCH_KEY, serverCapabilities, serverEnroll, serverLogin, snapshotRequiredDetails,
+  ServerAdapter, STATE_EPOCH_KEY, helloSession, serverCapabilities, serverEnroll, serverLogin, snapshotRequiredDetails,
   type AuthOptions, type ServerAdapterOptions,
 } from "./adapter";
 export { DEFAULT_FEED_TIMEOUTS, FeedLink, backoffDelay, type FeedOptions, type FeedTimeouts, type HelloContext } from "./feed";

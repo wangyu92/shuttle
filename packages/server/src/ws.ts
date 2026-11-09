@@ -178,7 +178,9 @@ export class Conn {
     if (h.since === null) reason = "no-cursor";
     else if (h.epoch !== v.epoch) reason = "epoch";
     else if (h.since < v.min_seq) reason = "cursor-too-old";
-    else if (v.rollback_at !== null && v.restored_seq !== null && h.since > v.restored_seq && h.rollbackAck !== v.rollback_at
+    // design §2.6.1 rollback rule. `seen` (max of since and seenMaxSeq) also covers a device whose own
+    // acked commit above restored_seq never came back through its feed (cursor == restored_seq).
+    else if (v.rollback_at !== null && v.restored_seq !== null && seen > v.restored_seq && h.rollbackAck !== v.rollback_at
       && srv.store.rollbackAckOf(v.vault_id, this.deviceId) !== v.rollback_at) reason = "rollback";
     if (reason) return this.park(reason, h.rid);
     this.epoch = v.epoch;
@@ -199,6 +201,26 @@ export class Conn {
       rollbackAt: reason === "rollback" ? v?.rollback_at ?? null : null,
     };
     this.send(m);
+  }
+
+  /**
+   * design §2.11 step 5: the rebuilding device itself is not parked. Its open feed follows the new epoch
+   * (commits are checked against it) and keeps its cursor: seqs are monotonic and head_seq is kept, so the
+   * only seqs it skips are the dropped history. A parked or not yet greeted socket is left as it is.
+   */
+  adoptEpoch(epoch: number): void {
+    if (this.state !== "catchup" && this.state !== "live") return;
+    this.epoch = epoch;
+    // A cursor below the new min_seq would later be parked as cursor-too-old by the pump (catch-up, or a
+    // live socket that falls back to catch-up under backpressure). The dropped range holds no heads any
+    // more, so bridge it with an empty frame (the answer headsSince gives). min_seq = head right after a
+    // rebuild, so the bridge also ends at the head, as a live frame must.
+    const v = this.srv.store.vault(this.vaultId!);
+    if (v && this.lastTo < v.min_seq) {
+      const live = this.state === "live";
+      this.sendChanges(this.lastTo, v.min_seq, [], !live, live, v.head_seq, v.min_seq);
+    }
+    this.schedulePump();
   }
 
   private onCommit(msg: CommitMsg, frameBytes: number): void {

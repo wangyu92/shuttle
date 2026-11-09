@@ -54,6 +54,15 @@ export interface WatcherOptions {
   budgetRecheckMs?: number;
 }
 
+/** What a walk of a newly appeared directory found (see Watcher.watchTree). */
+interface NewTree { renames: Array<{ from: string; to: string }>; files: string[]; incomplete: boolean }
+/** A new directory with more files than this is left to a rescan instead of one create event per file. */
+const NEW_TREE_EVENT_MAX = 1000;
+/** Wait before reporting files found in a new directory (see Watcher.settleBefore). */
+const NEW_TREE_SETTLE_MS = 30;
+/** One raw event being classified. */
+interface Job { p: Promise<void> | null; seq: number }
+
 const ERROR_WINDOW_MS = 10 * 60 * 1000;
 const MAX_ERRORS = 3;
 const MISS_STREAK_LIMIT = 3;
@@ -71,6 +80,9 @@ export class Watcher {
   private readonly movedAway = new Map<string, number>();
   private readonly reported = new Map<string, number>();      // NFC path → last event time
   private errorTimes: number[] = [];
+  /** Raw events still being classified (see settleBefore). */
+  private readonly inflight = new Map<Promise<void>, number>();
+  private jobSeq = 0;
   private scanSub: { dispose(): void } | null = null;
   private budgetTimer: NodeJS.Timeout | null = null;
   private running = false;
@@ -160,20 +172,47 @@ export class Watcher {
     return this.o.prune?.(rel) ?? false;
   }
 
-  /** Watch `rel` and every directory under it (pruned like the scan). */
-  private async watchTree(rel: string): Promise<void> {
+  /**
+   * Watch `rel` and every directory under it (pruned like the scan). With `found` (a directory that
+   * just appeared), every directory below `rel` whose inode belongs to a folder that just vanished, or
+   * to another watched folder, is collected as a folder move: `mkdir b && mv a b/a` puts the moved
+   * folder inside a directory nobody watched yet, so no event names it (design §3.18 I17: a folder
+   * move keeps every fileId). `found.files` lists the files outside those moved subtrees: they are
+   * reported as creates, so an unlink + add into a new folder pairs into a move like any other (I18).
+   */
+  private async watchTree(rel: string, found?: NewTree): Promise<void> {
     const stack = [rel];
+    const covered = (d: string): boolean => found?.renames.some((r) => d === r.to || d.startsWith(r.to + "/")) ?? false;
     while (stack.length > 0 && this.running && this.stats.mode !== "poll") {
       const dir = stack.pop() as string;
       if (this.watchers.has(dir) || this.shouldPrune(dir)) continue;
       const abs = dir === "" ? this.o.fs.root : await this.o.fs.resolve(dir);
-      if (abs === null) continue;
-      if (!this.addWatcher(dir, abs)) return;
+      if (abs === null) {
+        if (found) found.incomplete = true;
+        continue;
+      }
+      if (found && dir !== rel && !covered(dir)) {
+        const st = await fsp.lstat(abs).catch(() => null);
+        const from = st ? this.movedFrom(dir, st.ino) : null;
+        if (from !== null) found.renames.push({ from, to: dir });
+      }
+      if (!this.addWatcher(dir, abs)) {
+        if (found) found.incomplete = true;
+        return;
+      }
       let names: import("node:fs").Dirent[];
       try {
         names = await fsp.readdir(abs, { withFileTypes: true });
       } catch {
+        if (found) found.incomplete = true;
         continue;
+      }
+      if (found && !covered(dir)) {
+        for (const d of names) {
+          if (!d.isFile()) continue;
+          if (found.files.length >= NEW_TREE_EVENT_MAX) { found.incomplete = true; break; }
+          found.files.push((dir ? `${dir}/${d.name}` : d.name).normalize("NFC"));
+        }
       }
       for (const d of names) {
         if (!d.isDirectory()) continue;
@@ -181,6 +220,28 @@ export class Watcher {
         stack.push(child);
       }
     }
+    if (found && stack.length > 0) found.incomplete = true;   // stopped or fell back to polling mid-walk
+  }
+
+  /**
+   * The old path of a folder that now lives at `rel` (same inode): a vanished folder still held, or a
+   * watched folder whose own "gone" event has not arrived yet (that event is then dropped).
+   */
+  private movedFrom(rel: string, ino: number): string | null {
+    const gone = this.goneDirs.get(ino);
+    if (gone) {
+      clearTimeout(gone.timer);
+      this.goneDirs.delete(ino);
+      return gone.rel;
+    }
+    for (const [d, i] of this.dirIno) {
+      if (i === ino && d !== rel) {
+        this.unwatchTree(d);
+        this.movedAway.set(d, this.now());
+        return d;
+      }
+    }
+    return null;
   }
 
   private addWatcher(dir: string, abs: string): boolean {
@@ -231,21 +292,51 @@ export class Watcher {
     const rel = (dir ? `${dir}/${name}` : name).normalize("NFC");
     this.reported.set(rel, this.now());
     const abs = path.join(absDir, name);
-    void (async () => {
+    const job: Job = { p: null, seq: ++this.jobSeq };
+    job.p = (async () => {
       // inotify's move/delete-self event of a watched directory arrives with the directory's own name;
       // the parent's watcher reports the move. Drop it when the directory is gone or is another inode.
       if (name === path.basename(absDir) && dir !== "") {
         const self = await fsp.lstat(absDir).catch(() => null);
         if (!self || self.ino !== this.dirIno.get(dir)) return;
       }
-      await this.classify(rel, abs, type);
+      await this.classify(rel, abs, type, job);
     })().catch((err: unknown) => {
       this.o.log?.error("watcher", "watcher event failed", { err: String(err) });
       this.emit({ t: "rescan-hint" });
+    }).finally(() => {
+      if (job.p) this.inflight.delete(job.p);
     });
+    this.inflight.set(job.p, job.seq);
   }
 
-  private async classify(rel: string, abs: string, type: string): Promise<void> {
+  /**
+   * A create waits for the raw events received before it: a rename inside one folder is IN_MOVED_FROM
+   * then IN_MOVED_TO, and the two lstat calls can finish in either order on a loaded host. The engine
+   * pairs a delete with a later create (I18), so the delete must be reported first. Waits only on
+   * earlier jobs (no cycles); a job waiting in settleBefore has left the map.
+   */
+  private async afterEarlier(job: Job): Promise<void> {
+    const earlier: Array<Promise<void>> = [];
+    for (const [p, seq] of this.inflight) if (seq < job.seq) earlier.push(p);
+    if (earlier.length > 0) await Promise.allSettled(earlier);
+  }
+
+  /**
+   * Before reporting files found by walking a new directory: let the events already queued behind it
+   * finish first. `mkdir d && mv x d/x` queues the unlink of x after the creation of d, and the walk
+   * of d finds x; the engine pairs a delete with a later create (I18), never a create with a later
+   * delete. A short delay lets the kernel's queued events reach us, then every other event in flight
+   * is awaited (a job waiting here has left the set, so two such jobs never wait on each other).
+   */
+  private async settleBefore(job: Job): Promise<void> {
+    if (job.p) this.inflight.delete(job.p);
+    await new Promise<void>((r) => setTimeout(r, NEW_TREE_SETTLE_MS));
+    // Bounded: during an event storm new jobs keep arriving; three rounds cover the queued ones.
+    for (let round = 0; round < 3 && this.inflight.size > 0 && this.running; round++) await Promise.allSettled([...this.inflight.keys()]);
+  }
+
+  private async classify(rel: string, abs: string, type: string, job: Job): Promise<void> {
     let st: import("node:fs").Stats | null = null;
     try {
       st = await fsp.lstat(abs);
@@ -290,31 +381,50 @@ export class Watcher {
       if (this.watchers.has(rel)) return;
       // A folder move inside the vault keeps the inode: report one folder rename (the engine moves
       // every entry under it, keeping fileIds), never a delete + create of each file.
-      const gone = this.goneDirs.get(st.ino);
-      let from: string | null = null;
-      if (gone) {
-        clearTimeout(gone.timer);
-        this.goneDirs.delete(st.ino);
-        from = gone.rel;
-      } else {
-        for (const [d, ino] of this.dirIno) if (ino === st.ino && d !== rel) { from = d; break; }
-        if (from !== null) {
-          this.unwatchTree(from);
-          this.movedAway.set(from, this.now());
+      const from = this.movedFrom(rel, st.ino);
+      if (from !== null) {
+        if (!this.shouldPrune(rel)) await this.watchTree(rel);
+        if (!this.isIgnored(from) && !this.isIgnored(rel)) {
+          this.emit({ t: "rename", from, to: rel, kind: "folder" });
+          return;
         }
-      }
-      if (!this.shouldPrune(rel)) await this.watchTree(rel);
-      if (from !== null && !this.isIgnored(from) && !this.isIgnored(rel)) {
-        this.emit({ t: "rename", from, to: rel, kind: "folder" });
+        this.emit({ t: "delete", path: from, kind: "folder" });
+        if (!this.isIgnored(rel)) this.emit({ t: "rescan-hint" });
         return;
       }
-      // Files may have landed before the watch existed (mv of a folder into the vault).
-      if (from !== null) this.emit({ t: "delete", path: from, kind: "folder" });
-      if (!this.isIgnored(rel)) this.emit({ t: "rescan-hint" });
+      // A new folder: moved folders may sit inside it (mkdir + mv into it before the watch existed).
+      if (this.shouldPrune(rel)) {
+        if (!this.isIgnored(rel)) this.emit({ t: "rescan-hint" });
+        return;
+      }
+      const found: NewTree = { renames: [], files: [], incomplete: false };
+      await this.watchTree(rel, found);
+      let rescan = found.incomplete;
+      for (const r of found.renames) {
+        if (!this.isIgnored(r.from) && !this.isIgnored(r.to)) {
+          this.emit({ t: "rename", from: r.from, to: r.to, kind: "folder" });
+          continue;
+        }
+        if (!this.isIgnored(r.from)) this.emit({ t: "delete", path: r.from, kind: "folder" });
+        rescan = true;
+      }
+      // Files may have landed before the watch existed (mv of a folder into the vault, a write right
+      // after mkdir): each one is a create; a walk cut short (or too large) leaves them to a rescan.
+      if (rescan) {
+        if (!this.isIgnored(rel)) this.emit({ t: "rescan-hint" });
+        return;
+      }
+      if (found.files.length > 0) await this.settleBefore(job);
+      for (const f of found.files) if (!this.isIgnored(f)) this.emit({ t: "create", path: f });
       return;
     }
     if (!st.isFile() || this.isIgnored(rel)) return;
-    this.emit({ t: type === "rename" ? "create" : "modify", path: rel });
+    if (type === "rename") {
+      await this.afterEarlier(job);
+      this.emit({ t: "create", path: rel });
+      return;
+    }
+    this.emit({ t: "modify", path: rel });
   }
 
   private unwatchTree(rel: string): void {

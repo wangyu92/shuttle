@@ -142,15 +142,26 @@ export class Sim {
   private touched = new Map<string, Array<{ device: string; kind: 'write' | 'delete'; step: number }>>();
   private touchedFolders = new Set<string>();
   private rebuiltInWindow = false;
+  /** Steps of remote rebuilds in this window. */
+  private rebuiltAt: number[] = [];
   /**
    * Store evictions in this window and the step their rebuild finished (null: still running). A
    * delete made before a rebuild finished may come back: rebuild mode never deletes (§3.3.5, S26).
    */
   private evictions: Array<{ device: SimDevice; at: number; done: number | null }> = [];
+  /**
+   * Remote rebuilds and, per device, the step its epoch resync for that rebuild finished. A delete made
+   * on a device that had not finished it yet is planned against the new epoch, where absence never
+   * means delete (design §2.11 step 5, row C6 FORGET): the file may come back. Kept across windows
+   * until every device caught up.
+   */
+  private rebuilds: Array<{ at: number; epoch: number; caught: Map<string, number> }> = [];
   /** Steps of server compactions in this window: a purged tombstone may come back (I21, S8/C5). */
   private compactedAt: number[] = [];
-  /** Server live heads (path → hash) at the last checkpoint. */
-  private lastHeads: Map<string, string> | null = null;
+  /** Server live heads (path → hash and fileId) at the last checkpoint. */
+  private lastHeads: Map<string, { hash: string; fileId: string }> | null = null;
+  /** FileIds of files a deferred (out-of-scope) user action touched (exempt like `deferred` paths). */
+  private deferredIds = new Set<string>();
   private violationsSeen = 0;
 
   constructor(readonly o: SimOptions) {
@@ -620,6 +631,8 @@ export class Sim {
           await d.engine.rebuildRemote({ confirmFiltered: true });
           this.stats.rebuilds++;
           this.rebuiltInWindow = true;
+          this.rebuiltAt.push(this.step);
+          this.rebuilds.push({ at: this.step, epoch: d.engine.helloContext().epoch ?? 0, caught: new Map() });
           this.log({ a, d: d.name, ok: true });
         } catch (e) {
           this.log({ a, d: d.name, ok: false, err: e instanceof Error ? e.name : "?" });
@@ -636,7 +649,14 @@ export class Sim {
   private onlineChecks(): void {
     for (const e of this.evictions) {
       const d = e.device;
-      if (e.done === null && !d.dead && d.engine.isConnected() && d.engine.ctx.mode === "incremental") e.done = this.step;
+      if (e.done === null && !d.dead && d.engine.isConnected() && d.engine.ctx.mode === "incremental" && d.engine.status().status === "synced") e.done = this.step;
+    }
+    for (const r of this.rebuilds) {
+      for (const d of this.devices) {
+        // "synced" also rules out a pending epoch resync (the seen epoch moves at connect, before it).
+        if (r.caught.has(d.name) || d.dead || !d.engine.isConnected() || d.engine.ctx.mode !== "incremental" || d.engine.status().status !== "synced") continue;
+        if ((d.engine.helloContext().epoch ?? 0) >= r.epoch && this.step > r.at) r.caught.set(d.name, this.step);
+      }
     }
     for (let i = this.violationsSeen; i < this.netViolations.length; i++) {
       const v = this.netViolations[i]!;
@@ -785,14 +805,22 @@ export class Sim {
       // A delete by one device alone, in its active scope, must stay deleted everywhere (no ghost).
       // A store eviction after the delete (on the deleter, or on a device that had not applied it yet)
       // rebuilds without a base: rebuild mode never deletes, so the file may come back (§3.3.5, S26).
-      const evicted = this.evictions.some((e) => (e.done ?? Infinity) >= last.step) || this.compactedAt.some((c) => c >= last.step);
+      // A remote rebuild after the delete drops its tombstone: devices that had not applied the delete
+      // re-create the file in epoch mode, never delete (design §2.11 step 5, rows S8/C5).
+      const evicted = this.evictions.some((e) => (e.done ?? Infinity) >= last.step) || this.compactedAt.some((c) => c >= last.step) ||
+        this.rebuiltAt.some((r) => r >= last.step) ||
+        this.rebuilds.some((r) => r.at <= last.step && (r.caught.get(last.device) ?? Infinity) >= last.step);
       if (devs.size === 1 && last.kind === "delete" && !evicted && heads.has(p) && actor.scopeOf(p, heads.get(p)!.size) === "active") {
         this.fail("ghost", `${p} deleted on ${last.device} is back`);
       }
     }
+    // A deferred (out-of-scope) action follows the file, not the path: a remote move may carry the file
+    // to a path the deferral never named before the action reaches the remote (S11).
+    for (const [p, h] of [...(this.lastHeads ?? new Map()), ...heads]) if (this.isDeferred(p)) this.deferredIds.add(h.fileId);
     if (this.lastHeads) {
-      for (const [p, h] of this.lastHeads) {
-        if (this.touched.has(p) || underTouched(p) || this.isDeferred(p)) continue;
+      for (const [p, prev] of this.lastHeads) {
+        if (this.touched.has(p) || underTouched(p) || this.isDeferred(p) || this.deferredIds.has(prev.fileId)) continue;
+        const h = prev.hash;
         const now = heads.get(p);
         if (now && now.hash === h) continue;
         // After a rebuild from a filtered device, files nobody holds in scope may leave the epoch (§2.11).
@@ -800,11 +828,13 @@ export class Sim {
         this.fail(now ? "spontaneous-change" : "spontaneous-delete", `${p} ${now ? "changed" : "vanished"} without a user action`);
       }
     }
-    this.lastHeads = new Map([...heads].map(([p, r]) => [p, r.hash]));
+    this.lastHeads = new Map([...heads].map(([p, r]) => [p, { hash: r.hash, fileId: r.fileId }]));
     this.touched = new Map();
     this.family = new Map();
     this.touchedFolders = new Set();
     this.rebuiltInWindow = false;
+    this.rebuiltAt = [];
+    this.rebuilds = this.rebuilds.filter((r) => r.caught.size < this.devices.length);
     this.compactedAt = [];
     this.evictions = [];
     this.log({ a: "checkpoint", heads: heads.size, ledger: this.ledger.entries.size });

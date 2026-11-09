@@ -24,10 +24,12 @@ function check(i: PlanInput, a: Action): void {
     return;
   }
   const p1 = pathTakenApplies(i);
-  // Never PUSH_DELETE when L exists; only for an unchanged remote at B.
+  // Never PUSH_DELETE when L exists; only for a remote whose content and path are still B's (the
+  // head at B, or a newer head that only re-stated B, e.g. an epoch re-create), with base = that head.
   if (a.type === "PUSH_DELETE") {
     expect(L).toBeNull();
-    expect(B && R && !R.deleted && R.seq === B.version).toBeTruthy();
+    expect(B && R && !R.deleted && (R.seq === B.version || (R.contentHash === B.hash && R.path === B.path))).toBeTruthy();
+    expect(a.base).toBe(R!.seq);
   }
   // Destructive local actions only touch content that is safe elsewhere.
   if (a.type === "LOCAL_DELETE") {

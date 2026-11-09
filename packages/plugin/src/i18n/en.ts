@@ -92,6 +92,8 @@ export const EN: Readonly<Record<string, string>> = Object.freeze({
   "log.rebuildRemoteFailed": "Rebuilding the remote vault failed: {error}",
   "log.tornMergeRestored": "Restored an interrupted merge",
   "log.tornWriteReplaced": "Repaired an interrupted download",
+  "log.tornWriteKeptEdit": "Kept a local edit made after an interrupted write",
+  "log.stagedArchived": "Saved an unsent merge to the file history",
 
   // settings (§5.4)
   "set.remote.name": "Remote vault",

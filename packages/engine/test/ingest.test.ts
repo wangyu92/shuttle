@@ -173,17 +173,33 @@ describe("torn writes (design §3.8.4 S9, I30)", () => {
     expect(await b.store.tx(["intents"], (tx) => tx.intents.getAll(), "readonly")).toEqual([]);
   });
 
-  it("reconcile treats a torn file as an engine write (reapply), not as a user edit", async () => {
+  it("reconcile treats a torn file (strict prefix of the target) as an engine write (reapply)", async () => {
     const { w, a, b } = await pair("torn2");
+    edit(w, a, "doc.md", "one two three\n");
+    await a.sync();
+    await b.sync();
+    const e = b.index.byPath("doc.md")!;
+    const R = b.index.remote.byFileId(e.fileId)!;
+    await b.intents.put({ path: "doc.md", fileId: e.fileId, preHash: "0".repeat(64), targetHash: R.contentHash });
+    edit(w, b, "doc.md", "one tw");
+    await b.sync();
+    expect(b.fs.readText("doc.md")).toBe("one two three\n");
+    expect(w.server.calls.filter((c) => c.device === b.deviceId && c.method === "commit")).toHaveLength(0);
+  });
+
+  it("D5: foreign content that is not a prefix of the target is a user edit: kept and pushed", async () => {
+    const { w, a, b } = await pair("torn3");
     edit(w, a, "doc.md", "one\n");
     await a.sync();
     await b.sync();
     const e = b.index.byPath("doc.md")!;
     const R = b.index.remote.byFileId(e.fileId)!;
     await b.intents.put({ path: "doc.md", fileId: e.fileId, preHash: "0".repeat(64), targetHash: R.contentHash });
-    edit(w, b, "doc.md", "garbage");
+    edit(w, b, "doc.md", "my own words");
     await b.sync();
-    expect(b.fs.readText("doc.md")).toBe("one\n");
-    expect(w.server.calls.filter((c) => c.device === b.deviceId && c.method === "commit")).toHaveLength(0);
+    await a.sync();
+    expect(b.fs.readText("doc.md")).toBe("my own words");
+    expect(a.fs.readText("doc.md")).toBe("my own words");
+    expect(await b.store.tx(["intents"], (tx) => tx.intents.getAll(), "readonly")).toEqual([]);
   });
 });

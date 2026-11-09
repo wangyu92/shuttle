@@ -16,13 +16,14 @@
 
 import type {
   EngineHooks, FileEntry, FileId, FileKind, LocalFs, LocalStat, RemoteHead, RemoveMode, RetentionClass, Scope, StateStore,
+  WriteIntent,
 } from "@shuttle/protocol";
 import type { BlobPipeline } from "../content/BlobPipeline";
 import { readAndHash, sha256Hex } from "../content/hash";
 import { IntegrityError } from "../errors";
 import type { EchoSuppressor } from "../events/EchoSuppressor";
 import type { FileIndex } from "../index/FileIndex";
-import type { Journal } from "../journal/Journal";
+import { Journal, isStagedPut } from "../journal/Journal";
 import { ILLEGAL_NAME_LOG } from "../path/illegal";
 import { dirname, foldKey } from "../path/normalize";
 import { hasFsCode } from "../platform/LocalFs";
@@ -34,7 +35,7 @@ import { toHex, utf8DecodeStrict } from "../util/bytes";
 import type { KeyedMutex } from "../util/KeyedMutex";
 import { cryptoRandomBytes, type RandomBytes } from "../util/uuid";
 import { orderApplies, swapPath, type OrderItem } from "./BatchOrderer";
-import type { WriteIntents } from "./WriteIntents";
+import { isStrictPrefix, type WriteIntents } from "./WriteIntents";
 
 /** design §3.8.3: more pending local deletes than max(25, 10 % of active files) pause and ask. */
 export const MASS_DELETE_MIN = 25;
@@ -43,6 +44,8 @@ export const MASS_DELETE_FRACTION = 0.1;
 export const APPLY_STUCK_ATTEMPTS = 5;
 /** S20: processText retries before falling back to an atomic write. */
 export const PROCESS_TEXT_RETRIES = 3;
+/** D5: re-applies of one torn write before the file is held with an integrity error (never loops). */
+export const TORN_REAPPLY_MAX = 3;
 
 export interface ApplierLog { key: string; cat: 'general' | 'error' | 'skipped' | 'merge' | 'network'; params?: Record<string, string | number | boolean | null>; path?: string; fileId?: FileId }
 
@@ -73,7 +76,14 @@ export interface RemoteApplierDeps {
   editorHasOpen?(path: string): boolean;
   /** design §3.8.3 guard. Absent: deletes above the threshold are held (never applied silently). */
   confirmMassDelete?(count: number, active: number): boolean | Promise<boolean>;
+  /** The sender's user already approved this tombstone through its own mass-delete guard (§3.13). */
+  deleteApproved?(fileId: FileId, seq: number): boolean;
   noteApplied?(path: string): void;
+  /**
+   * D5: an older remote version of `fileId` whose content hash is `hash` (the target of an interrupted
+   * pull after the head moved on), or null when it is not retained. Absent: such writes count as edits.
+   */
+  targetHead?(fileId: FileId, hash: string): Promise<RemoteHead | null>;
   log?(e: ApplierLog): void;
   randomBytes?: RandomBytes;
 }
@@ -104,6 +114,14 @@ export interface DrainStats { applied: number; deleted: number; handoff: number;
 interface Observed { L: { path: string; hash: string; size: number; mtime: number; ino?: number; ctimeMs?: number }; st: LocalStat; bytes?: Uint8Array }
 
 export class RemoteApplier {
+  /** D5: torn re-applies per fileId in this session. */
+  private readonly tornAttempts = new Map<FileId, number>();
+  /**
+   * Torn writes whose target bytes were found only in an archive record (a staged merge archived after a
+   * CONFLICT, Journal I6): reapplyTorn restores those bytes, not the remote head (keyed by path).
+   */
+  private readonly tornArchived = new Map<string, Uint8Array>();
+
   constructor(private readonly d: RemoteApplierDeps) {}
 
   private crash(name: string): Promise<void> {
@@ -126,7 +144,10 @@ export class RemoteApplier {
       items.push({ fileId: r.fileId, R, localPath: e?.path ?? null });
     }
     // design §3.8.3 mass-delete guard on pull.
-    const deletes = items.filter((i) => i.R.deleted && i.localPath !== null && this.d.index.byFileId(i.fileId)?.obs);
+    // Deletes the sending device's user approved through its own guard do not ask again (one answer
+    // per burst, design §3.13); any other burst above the threshold still pauses here.
+    const deletes = items.filter((i) => i.R.deleted && i.localPath !== null && this.d.index.byFileId(i.fileId)?.obs &&
+      !this.d.deleteApproved?.(i.fileId, i.R.seq));
     const threshold = Math.max(MASS_DELETE_MIN, Math.floor(this.d.index.activeCount() * MASS_DELETE_FRACTION));
     let holdDeletes = false;
     if (deletes.length > threshold) {
@@ -136,7 +157,7 @@ export class RemoteApplier {
         this.d.log?.({ key: "log.massDeleteRemotePaused", cat: "general", params: { count: deletes.length } });
       }
     }
-    const ready = holdDeletes ? items.filter((i) => !(i.R.deleted && i.localPath !== null)) : items;
+    const ready = holdDeletes ? items.filter((i) => !(i.R.deleted && i.localPath !== null && !this.d.deleteApproved?.(i.fileId, i.R.seq))) : items;
     if (holdDeletes) s.held += items.length - ready.length;
     const { order, cycles } = orderApplies(ready, this.d.fs.configDir);
     for (const c of cycles) for (const out of await this.applyCycle(c)) count(s, out);
@@ -162,24 +183,156 @@ export class RemoteApplier {
     return keys;
   }
 
-  /** Torn engine write at `path` (design §3.8.4 `applier.reapply`): rewrite R. Caller holds the locks. */
+  /**
+   * Foreign content at `path` under a pull intent (design §3.8.4 `applier.reapply`, lead decision D5).
+   * Caller holds the locks. A merge write is restored from staging (D1). Otherwise the content is torn
+   * only when it is a strict prefix of the target bytes: then R is rewritten over it (I30), at most
+   * TORN_REAPPLY_MAX times per file before an integrity error holds the file. Any other content is the
+   * user's edit against the base preHash: the intent is dropped and the Planner treats it as a local
+   * change (merge or conflict copy), never overwritten with the remote head (I6).
+   */
   async reapply(path: string): Promise<ApplyOutcome> {
     // D1: an interrupted merge write is re-applied from its staged bytes, never from the remote head.
     const m = await this.recoverMerge(path);
     if (m !== null) return m;
-    const i = await this.d.intents.get(path);
+    const ic = await this.d.intents.check(path);
+    const i = ic.intent;
     if (!i) return "noop";
-    const R = this.d.index.remote.byFileId(i.fileId);
-    if (!R || R.deleted || (i.targetHash !== null && i.targetHash !== R.contentHash)) {
-      // Not a pull of the current head (merge write, or the head moved on): the torn bytes are never
-      // pushed; the current remote head is written instead and the change logged.
-      this.d.log?.({ key: "log.tornWriteReplaced", cat: "error", path, fileId: i.fileId });
+    if (ic.c !== "foreign") {
+      // Not foreign (any more): the normal apply decides; a stale intent never blocks it.
+      return this.applyLocked(i.fileId);
     }
+    const cls = await this.classifyForeign(path, i);
+    if (cls === "retry") {
+      this.d.markDirty({ path }, "retry");
+      return "retry";
+    }
+    if (cls === "edit") {
+      await this.userEditOverIntent(path, i.fileId);
+      return "handoff";
+    }
+    return this.reapplyTorn(path, i.fileId);
+  }
+
+  /** reapply() with the locks taken here (startup list of foreign files, design §3.8.4). */
+  async reapplyAt(path: string, fileId: FileId): Promise<ApplyOutcome> {
+    const R = this.d.index.remote.byFileId(fileId);
+    const e = this.d.index.byFileId(fileId);
+    const unlock = await this.d.locks.acquire(...this.lockKeys(fileId, R, e, path));
+    try {
+      return await this.reapply(path);
+    } finally {
+      unlock();
+    }
+  }
+
+  /**
+   * D5 classification of foreign content at `path`: 'torn' when it is a strict prefix of the bytes the
+   * intent was writing, 'edit' otherwise (also when those bytes cannot be found any more: keeping the
+   * content can only cost a conflict copy, overwriting it could lose a user edit), 'retry' when the
+   * target bytes could not be fetched right now.
+   */
+  async classifyForeign(path: string, i: WriteIntent): Promise<'torn' | 'edit' | 'retry'> {
+    const d = this.d;
+    if (i.targetHash === null) return "edit";
+    let cur: Uint8Array;
+    try {
+      cur = await d.fs.read(path);
+    } catch (err) {
+      if (hasFsCode(err, "ENOENT") || hasFsCode(err, "ENOTDIR")) return "edit";
+      throw err;
+    }
+    const R = d.index.remote.byFileId(i.fileId);
+    let T: RemoteHead | null = R && !R.deleted && R.contentHash === i.targetHash ? R : null;
+    try {
+      if (!T && d.targetHead) T = await d.targetHead(i.fileId, i.targetHash);
+      if (!T) return "edit";
+      // Size known: anything as long as the target cannot be a strict prefix of it.
+      if (cur.length >= T.size) return "edit";
+      const target = await d.blobs.download(T, d.rcOf(T.path));
+      if (!isStrictPrefix(cur, target)) return "edit";
+      if (T.archive === true) this.tornArchived.set(path, target);
+      return "torn";
+    } catch (err) {
+      if (err instanceof IntegrityError) return "edit";
+      if (isRetryable(err)) return "retry";
+      throw err;
+    }
+  }
+
+  /** D5: the user edited the file after our write was interrupted: keep it, plan it as a local change. */
+  private async userEditOverIntent(path: string, fileId: FileId): Promise<void> {
+    const d = this.d;
+    await d.intents.delete(path);
+    this.tornAttempts.delete(fileId);
+    d.log?.({ key: "log.tornWriteKeptEdit", cat: "merge", path, fileId });
+    const e = d.index.byPath(path) ?? d.index.byFileId(fileId);
+    d.markDirty(e ? { fileId: e.fileId, path } : { path }, "retry");
+    const own = d.index.byFileId(fileId);
+    if (own && e?.fileId !== fileId) d.markDirty({ fileId, path: own.path }, "remote");
+  }
+
+  /** D5: rewrite R over a torn write, bounded (never loops). */
+  private async reapplyTorn(path: string, fileId: FileId): Promise<ApplyOutcome> {
+    const d = this.d;
+    const archived = this.tornArchived.get(path);
+    this.tornArchived.delete(path);
+    if (archived) {
+      // D1 + I6: the torn write was a merge whose staged op was archived (CONFLICT): restore the merged
+      // bytes, then the Planner merges them with the current head like any local change.
+      d.echo.expect(path, { hash: await sha256Hex(archived), size: archived.length });
+      await d.fs.write(path, archived, { mtime: d.now() });
+      await d.intents.delete(path);
+      this.tornAttempts.delete(fileId);
+      d.log?.({ key: "log.tornMergeRestored", cat: "merge", path, fileId });
+      const e = d.index.byPath(path);
+      d.markDirty(e ? { fileId: e.fileId, path } : { path }, "retry");
+      return "handoff";
+    }
+    const n = (this.tornAttempts.get(fileId) ?? 0) + 1;
+    this.tornAttempts.set(fileId, n);
+    const R = d.index.remote.byFileId(fileId);
     if (!R) {
-      await this.d.intents.delete(path);
+      await d.intents.delete(path);
+      this.tornAttempts.delete(fileId);
       return "gone";
     }
-    return this.applyLocked(i.fileId, { planned: true, torn: path });
+    if (n > TORN_REAPPLY_MAX) {
+      // The re-apply keeps failing: hold the file (its torn bytes are never pushed) and move on.
+      await d.intents.delete(path);
+      this.tornAttempts.delete(fileId);
+      await this.quarantine(fileId, R, new IntegrityError(`torn write at ${path} could not be repaired`, "tornWrite"));
+      return "integrity";
+    }
+    const e = d.index.byFileId(fileId);
+    if ((!e || e.path !== path) && R.path !== path) {
+      // A stray torn write: the file has moved on (remote move, or the entry lives elsewhere), so no
+      // copy of it belongs at this path. The prefix of our own write is removed (to the trash in trash
+      // mode), never pushed, and the file is applied where it lives now.
+      d.log?.({ key: "log.tornWriteReplaced", cat: "error", path, fileId });
+      d.echo.expect(path, "deleted");
+      try {
+        await d.fs.remove(path, d.deleteMode());
+      } catch (err) {
+        if (!hasFsCode(err, "ENOENT")) throw err;
+      }
+      await d.intents.delete(path);
+      await this.removeEmptyParents(path);
+      this.tornAttempts.delete(fileId);
+      return this.applyLocked(fileId);
+    }
+    if (R.deleted || (await this.intentTarget(path)) !== R.contentHash) {
+      // The head moved on (or was deleted) since the torn write: the torn bytes are never pushed; the
+      // current remote head is written instead and the change logged.
+      d.log?.({ key: "log.tornWriteReplaced", cat: "error", path, fileId });
+    }
+    const out = await this.applyLocked(fileId, { planned: true, torn: path });
+    if (out === "applied" || out === "noop" || out === "deleted" || out === "gone") this.tornAttempts.delete(fileId);
+    return out;
+  }
+
+  private async intentTarget(path: string): Promise<string | null> {
+    return (await this.d.intents.get(path))?.targetHash ?? null;
   }
 
   /** D1 merge-write recovery at `path` (null: the intent there is not a merge write). Caller holds the locks. */
@@ -189,6 +342,8 @@ export class RemoteApplier {
     if (r === "none") return null;
     await this.crash("apply:mergeRecovered");
     if (r === "restored") d.log?.({ key: "log.tornMergeRestored", cat: "merge", path });
+    // The staged merge stays queued; a later change of the file archives it (Journal, I6).
+    if (r === "userEdit") d.log?.({ key: "log.tornWriteKeptEdit", cat: "merge", path });
     const e = d.index.byPath(path);
     d.markDirty(e ? { fileId: e.fileId, path } : { path }, "retry");
     return r === "restored" ? "applied" : "noop";
@@ -207,8 +362,14 @@ export class RemoteApplier {
     const targetPath = opts.targetPath ?? R.path;
 
     // ---- gates ----
-    const sc = d.scopeOf(targetPath, R.deleted ? undefined : R.size);
+    // A tombstone acts on the local copy: when this device holds the file in scope, the delete applies
+    // there even if the file was moved out of this device's scope before it was deleted (D6).
+    const gatePath = R.deleted && e && e.scope === "active" ? e.path : targetPath;
+    const sc = d.scopeOf(gatePath, R.deleted ? undefined : R.size);
     if (sc !== "active") {
+      if (!R.deleted && (sc === "excluded" || sc === "ignored") && e && e.scope === "active" && e.path !== targetPath && !opts.targetPath) {
+        return this.movedOutOfScope(fileId, R, e, sc);
+      }
       await this.defer(fileId, R, sc === "illegal" ? "illegal" : sc === "oversize" ? "oversize" : "scope", e);
       return "scope";
     }
@@ -222,13 +383,19 @@ export class RemoteApplier {
       return "hold";
     }
 
+    // ---- a remote move out of a folder this device excludes ----
+    if (e && e.scope !== "active" && e.path !== targetPath && !R.deleted && !opts.targetPath) {
+      const detached = await this.movedIntoScope(fileId, R, e, targetPath);
+      if (detached) return this.applyLocked(fileId, opts);
+    }
+
     // ---- locate and observe ----
     const localPath = await this.locate(e, R, targetPath);
     const obs = await this.observe(localPath, e);
     const torn = opts.torn !== undefined && opts.torn === localPath;
     if (!torn && obs && !opts.planned) {
       const ic = await d.intents.check(localPath);
-      if (ic.c === "torn") {
+      if (ic.c === "foreign" && ic.intent) {
         const m = await this.recoverMerge(localPath);
         if (m !== null) {
           // The restored merge is a local change against R: the Planner decides (it pushes it).
@@ -236,7 +403,21 @@ export class RemoteApplier {
           d.markDirty(e ? { fileId, path: e.path } : { path: localPath }, "remote");
           return "handoff";
         }
-        return this.applyLocked(fileId, { ...opts, planned: true, torn: localPath });
+        const cls = await this.classifyForeign(localPath, ic.intent);
+        if (cls === "retry") {
+          await this.bump(fileId, "torn check needs the network");
+          return "retry";
+        }
+        if (cls === "torn") {
+          if (ic.intent.fileId === fileId) return this.reapplyTorn(localPath, fileId);
+          // Our torn write for another entry sits here: that entry's re-apply repairs it first.
+          d.markDirty({ path: localPath }, "retry");
+          await this.bump(fileId, "torn write of another entry at the path");
+          return "blocked";
+        }
+        // D5: a user edit over an interrupted pull. Fall through: the hand-to-Planner check below
+        // sees a local change against the base and hands the file over (never overwritten).
+        await this.userEditOverIntent(localPath, ic.intent.fileId);
       }
     }
     const planned = opts.planned === true || torn;
@@ -341,7 +522,18 @@ export class RemoteApplier {
         await d.fs.mkdirp(dirname(localPath)).catch(() => undefined);
         const w: { mtime: number; ctime?: number } = { mtime: R.mtime };
         if (R.ctime !== undefined) w.ctime = R.ctime;
-        written = await d.fs.write(localPath, bytes, w);
+        try {
+          written = await d.fs.write(localPath, bytes, w);
+        } catch (err) {
+          // A write torn in this session (the file holds a strict prefix of the bytes, D5) is
+          // rewritten once right away: left torn, a user delete or edit of the prefix before the
+          // next repair would be taken for a reason to re-apply or keep it (I30, no ghost).
+          if (!(err instanceof Error) || err.name === "Crash" || err.name === "StateStoreError") throw err;
+          // Unreadable right now: rewrite only a file that did not exist before (nothing to lose).
+          const cur = await d.fs.read(localPath).catch(() => null);
+          if (cur ? !isStrictPrefix(cur, bytes) : obs !== null) throw err;
+          written = await d.fs.write(localPath, bytes, w);
+        }
       }
       await this.crash("apply:written");
     }
@@ -398,6 +590,86 @@ export class RemoteApplier {
     if (opts.replaces && opts.replaces !== fileId) d.journal.unmirror(opts.replaces);
     d.noteApplied?.(targetPath);
     return contentOk && localPath === targetPath ? "noop" : "applied";
+  }
+
+  /**
+   * Lead decision D6 (클로드 제안(미승인)): a remote move of an active file into a folder this device
+   * excludes. The file is gone from this device's scope: the entry follows the move (out of scope at the
+   * new path, `synced` kept, S11) and the local copy at the old path is removed only when it still holds
+   * synced content. A file the user changed here stays at the old path as a new local file (new fileId,
+   * pushed as a create), so nothing is lost (I6). Re-including the folder pulls the file back (rescope).
+   */
+  private async movedOutOfScope(fileId: FileId, R: RemoteHead, e: FileEntry, sc: Scope): Promise<ApplyOutcome> {
+    const d = this.d;
+    const oldPath = e.path;
+    const obs = await this.observe(oldPath, e);
+    const ours = obs !== null && this.isOurs(e, obs.L.hash, R) && !(await this.hasPendingOp(fileId));
+    if (obs && ours) {
+      d.echo.expect(oldPath, "deleted");
+      try {
+        await d.fs.remove(oldPath, d.deleteMode());
+      } catch (err) {
+        if (!hasFsCode(err, "ENOENT")) throw err;
+      }
+      await this.crash("apply:movedOutRemoved");
+      await this.removeEmptyParents(oldPath);
+    }
+    await d.index.write(["applyQueue", "deferred", "journal", "staging", "intents"], async (w) => {
+      const cur = w.entry(fileId);
+      if (cur) {
+        // Local content that is not ours belongs to a new file now: its pending op must not move with it.
+        if (obs && !ours) await cancelOpIn(w.tx, fileId);
+        await w.putEntry({ ...cur, path: R.path, foldKey: foldKey(R.path), scope: sc, obs: null, updatedAt: d.now() });
+      }
+      await w.tx.deferred.put({ fileId, seq: R.seq, reason: "scope", path: R.path, deferredAt: d.now() });
+      const q = await w.tx.applyQueue.get(fileId);
+      if (q && q.seq <= R.seq) await w.tx.applyQueue.delete(fileId);
+      await w.tx.intents.delete(oldPath);
+    });
+    await this.crash("apply:movedOutCommitted");
+    if (obs && !ours) {
+      d.log?.({ key: "log.movedOutKeptLocal", cat: "general", path: oldPath, fileId });
+      d.markDirty({ path: oldPath }, "new");
+    }
+    return "scope";
+  }
+
+  /**
+   * The remote head of a file this device holds out of scope (excluded folder) is at an active path:
+   * a remote move out of the folder (the counterpart of D6), or a local rename into the folder that was
+   * excluded before it was pushed. An unchanged local copy follows a remote move (the normal apply
+   * renames it).
+   * A copy the user changed or removed while it was out of scope is never touched (filters never
+   * delete, I12): the entry is detached from it and moves to the target path with no local copy, so the
+   * remote head is pulled there; the old file stays as an untracked out-of-scope file. Returns true
+   * when the entry was detached (the caller re-runs the apply).
+   */
+  private async movedIntoScope(fileId: FileId, R: RemoteHead, e: FileEntry, targetPath: string): Promise<boolean> {
+    const d = this.d;
+    const oldPath = e.path;
+    const obs = await this.observe(oldPath, e);
+    // Follow only a move the remote made (R.path differs from the synced path): a file the user moved
+    // into the excluded folder here stays where the user put it.
+    const remoteMoved = e.synced !== null && R.path !== e.synced.path;
+    if (obs && remoteMoved && this.isOurs(e, obs.L.hash, R) && !(await this.hasPendingOp(fileId))) return false;
+    await d.index.write(["journal", "staging", "intents"], async (w) => {
+      const cur = w.entry(fileId);
+      if (!cur) return;
+      await cancelOpIn(w.tx, fileId);
+      // No local copy and no base at the target: a later reconcile can only pull it, never push a delete.
+      await w.putEntry({ ...cur, path: targetPath, foldKey: foldKey(targetPath), scope: "active", obs: null, synced: null, updatedAt: d.now() });
+      await w.tx.bases.delete(fileId);
+      await w.tx.intents.delete(oldPath);
+    });
+    if (obs) d.markDirty({ path: oldPath }, "new");
+    return true;
+  }
+
+  private async hasPendingOp(fileId: FileId): Promise<boolean> {
+    return this.d.state.tx(["journal"], async (tx) => {
+      for (const op of await tx.journal.getAll({ index: "fileId", only: fileId })) if (op.kind !== "archive") return true;
+      return false;
+    }, "readonly");
   }
 
   // ---------- swaps ----------
@@ -566,6 +838,11 @@ export class RemoteApplier {
 async function cancelOpIn(tx: import("@shuttle/protocol").StateTx, fileId: FileId): Promise<void> {
   for (const op of await tx.journal.getAll({ index: "fileId", only: fileId })) {
     if (op.kind === "archive" || op.state === "sent") continue;
+    if (isStagedPut(op) && op.base !== null) {
+      // Staged bytes may be the only copy of a local edit (torn merge write): archive, never drop (I6).
+      await Journal.archiveStagedIn(tx, op);
+      continue;
+    }
     await tx.journal.delete(op.opSeq);
     await tx.staging.delete(op.opSeq);
   }

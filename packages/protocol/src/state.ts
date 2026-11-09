@@ -47,6 +47,8 @@ export interface RemoteHead {
   kv: number; deviceId: DeviceId; cid?: string; ts: number;
   /** Record header fields and inline flags needed to open `inline` and blobs later (engine part 2). */
   rc?: RetentionClass; z?: boolean; p?: boolean; ctime?: number;
+  /** Set only on a head read from an archive record for its content (torn-write check); never stored. */
+  archive?: boolean;
 }
 
 export interface BaseRow { fileId: FileId; version: Seq; hash: string; bytes: Uint8Array }

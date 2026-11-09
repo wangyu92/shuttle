@@ -12,5 +12,8 @@
     "@shuttle/engine": "0.0.0",
     "@shuttle/protocol": "0.0.0",
     "@shuttle/testkit": "0.0.0"
+  },
+  "scripts": {
+    "sim": "node --enable-source-maps bin/sim.mjs"
   }
 }

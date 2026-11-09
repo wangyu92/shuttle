@@ -24,7 +24,7 @@ import type { EchoSuppressor } from "../events/EchoSuppressor";
 import type { FileIndex } from "../index/FileIndex";
 import { Journal, type EnqueueReq } from "../journal/Journal";
 import { conflictCopyPath, conflictStamp, hostTzOffset } from "../merge/conflictName";
-import { DEFAULT_MERGE_OPTIONS, merge3, type MergeOptions } from "../merge/dmp3";
+import { DEFAULT_MERGE_OPTIONS, MERGE_MAX_BYTES, merge3, type MergeOptions } from "../merge/dmp3";
 import { canonOfBytes, mergeJson } from "../merge/jsonMerge";
 import { isTemplatePrefix, lwwDecide } from "../merge/MergePolicy";
 import { dirname, foldKey } from "../path/normalize";
@@ -306,6 +306,7 @@ export class Executor implements ActionExecutor {
     const R = d.index.remote.byFileId(a.remote.fileId);
     const L = L0;
     if (!R || R.deleted || !L) return;
+    if (await this.resolvedAgainst(a, L)) return;
     const local = await this.readExpect(L.path, L.hash);
     if (!local) return;
     let remote: Uint8Array;
@@ -331,8 +332,8 @@ export class Executor implements ActionExecutor {
           await d.applier.applyLocked(R.fileId, { planned: true, ...(a.replaces ? { replaces: a.replaces } : {}) });
           return;
         }
-        if (!m.equalsLocal) await this.writeLocal(L.path, a.fileId, m.bytes, L.hash);
-        await this.pushMerged(a, c, L.path);
+        if (m.equalsLocal) await this.pushMerged(a, c, L.path);
+        else if (!(await this.commitMerge(a, c, L, m.bytes))) return;
         d.log?.({ key: "log.mergeConflict", cat: "merge", path: a.path, fileId: a.fileId });
         return;
       }
@@ -358,25 +359,55 @@ export class Executor implements ActionExecutor {
     await this.conflictCopy(a.path, local, L, R, a.replaces);
   }
 
+  /**
+   * This conflict was already resolved: the file's pending (unsent) put op is based on R.seq, so the
+   * local content is the result of an earlier merge (or a later edit on top of it), not a fresh
+   * divergence. Re-merging would diff against the old base again and could make a needless conflict
+   * copy (a restored staged merge after a restart, D1). The op is kept, or refreshed from disk.
+   */
+  private async resolvedAgainst(a: Extract<Action, { type: 'MERGE' }>, L: LocalState): Promise<boolean> {
+    const d = this.d;
+    const pend = await d.state.tx(["journal", "staging"], async (tx) => {
+      const op = await Journal.slotOp(tx, a.fileId);
+      if (!op || op.state === "sent" || op.state === "failed" || op.kind !== "put" || op.base !== a.base) return null;
+      const row = op.source === "staging" ? await tx.staging.get(op.opSeq) : undefined;
+      return { op, staged: row?.bytes ?? null };
+    }, "readonly");
+    if (!pend) return false;
+    if (pend.op.path === a.path) {
+      if (pend.staged && (await sha256Hex(pend.staged)) === L.hash) return true;
+      if (!pend.staged && pend.op.source !== "staging" && (pend.op.contentHash === undefined || pend.op.contentHash === L.hash)) return true;
+    }
+    await this.enqueue({ kind: "put", fileId: a.fileId, path: a.path, base: a.base, hash: L.hash });
+    return true;
+  }
+
   /** dmp3 against the stored base; true when handled (clean merge). */
   private async mergeDmp3(a: Extract<Action, { type: 'MERGE' }>, c: ExecContext, L: LocalState, local: Uint8Array, remote: Uint8Array, R: RemoteHead): Promise<boolean> {
     const d = this.d;
+    // D2 (클로드 제안(미승인)): sides above the merge cap get a conflict copy, never a slow diff.
+    const opts = d.mergeOptions ?? DEFAULT_MERGE_OPTIONS;
+    const max = opts.maxBytes ?? MERGE_MAX_BYTES;
+    if (local.length > max || remote.length > max) {
+      d.log?.({ key: "log.mergeTooLarge", cat: "merge", path: a.path, fileId: a.fileId });
+      return false;
+    }
     const lt = utf8DecodeStrict(local);
     const rt = utf8DecodeStrict(remote);
     if (lt === null || rt === null) return false;
     const baseBytes = await this.baseOf(c.entry);
-    if (!baseBytes) return false;
+    if (!baseBytes || baseBytes.length > max) return false;
     const bt = utf8DecodeStrict(baseBytes);
     if (bt === null) return false;
-    const m = merge3(bt, lt, rt, d.mergeOptions ?? DEFAULT_MERGE_OPTIONS);
+    const m = merge3(bt, lt, rt, opts);
     if (!m.clean) return false;
     d.log?.({ key: "log.mergingConflictedFile", cat: "merge", path: a.path, fileId: a.fileId });
     if (m.text === rt) {
       await d.applier.applyLocked(R.fileId, { planned: true });
       return true;
     }
-    if (m.text !== lt) await this.writeLocal(L.path, a.fileId, new TextEncoder().encode(m.text), L.hash);
-    await this.pushMerged(a, c, L.path);
+    if (m.text === lt) await this.pushMerged(a, c, L.path);
+    else await this.commitMerge(a, c, L, new TextEncoder().encode(m.text));
     return true;
   }
 
@@ -524,17 +555,66 @@ export class Executor implements ActionExecutor {
     return bytes;
   }
 
-  /** Engine write of merged content, guarded by a write intent and an echo expectation. */
-  private async writeLocal(path: string, fileId: FileId, bytes: Uint8Array, preHash: string): Promise<void> {
+  /**
+   * Write merged content and push it (lead decision D1, 클로드 제안(미승인)). ONE transaction stages
+   * the merged plaintext as the file's push op (source 'staging', base = R.seq) and records the write
+   * intent (preHash = local, targetHash = merged); only then is the file written. A crash or a torn
+   * write at any point is recovered from staging (WriteIntents.recoverMerge), never from the remote
+   * head, and the push uploads the staged bytes, never a torn file (I6, I30). False when nothing was
+   * done (a frozen op of the file is in flight: the file is re-planned after its ack).
+   */
+  private async commitMerge(a: Extract<Action, { type: 'MERGE' }>, c: ExecContext, L: LocalState, bytes: Uint8Array): Promise<boolean> {
     const d = this.d;
+    const path = L.path;
     const h = await sha256Hex(bytes);
-    await d.intents.put({ path, fileId, preHash, targetHash: h });
+    const old = a.replaces && a.replaces !== a.fileId ? d.index.byFileId(a.replaces) : null;
+    const fromPath = d.index.byFileId(a.fileId)?.synced?.path;
+    const req: EnqueueReq = {
+      kind: "put", fileId: a.fileId, path: a.path, base: a.base, staged: bytes, mtime: d.now(),
+      ...(fromPath !== undefined ? { fromPath } : {}),
+    };
+    const r = await d.index.write(["journal", "staging", "intents"], async (w) => {
+      if (old) {
+        // Row N4: the never-synced local entry is replaced by R's fileId at the same path.
+        await Journal.cancelIn(w.tx, old.fileId);
+        await w.deleteEntry(old.fileId);
+        const cur = w.entry(a.fileId);
+        await w.putEntry({
+          fileId: a.fileId, path: a.path, foldKey: foldKey(a.path), scope: "active", kind: c.kind, synced: cur?.synced ?? null,
+          obs: null, updatedAt: d.now(),
+        });
+      }
+      const res = await d.journal.enqueueIn(w.tx, req);
+      if (res.t !== "waiting") await w.tx.intents.put({ path, fileId: a.fileId, preHash: L.hash, targetHash: h });
+      return res;
+    });
+    d.journal.afterCommit(req, r);
+    if (old) d.journal.unmirror(old.fileId);
+    if (r.t === "waiting") return false;
+    await this.crash("exec:mergeStaged");
     d.echo.expect(path, { hash: h, size: bytes.length });
-    const st = await d.fs.write(path, bytes, { mtime: d.now() });
+    let st;
+    try {
+      st = await d.fs.write(path, bytes, { mtime: d.now() });
+    } catch (err) {
+      // Write failed in this session. Untouched file: drop the staged merge and re-plan from scratch.
+      // Anything else (torn, gone): keep it; the torn check re-applies the staged merge (D1).
+      if (err instanceof Error && (err.name === "Crash" || err.name === "StateStoreError")) throw err;
+      const ic = await d.intents.check(path).catch(() => null);
+      if (ic?.c === "pre") {
+        await d.journal.cancel(a.fileId);
+        await d.intents.delete(path);
+      }
+      d.markDirty({ fileId: a.fileId, path }, "retry");
+      throw err;
+    }
     await this.crash("exec:mergedWritten");
-    await d.intents.delete(path);
-    const e = d.index.byPath(path);
-    if (e) await d.index.updateObs(e.fileId, observationOf(st, h));
+    await d.index.write(["intents"], async (w) => {
+      await w.tx.intents.delete(path);
+      const e = w.entry(a.fileId);
+      if (e && e.path === path) await w.putEntry({ ...e, obs: observationOf(st, h), updatedAt: d.now() });
+    });
+    return true;
   }
 }
 

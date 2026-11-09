@@ -104,11 +104,12 @@ describe("group commit", () => {
       }
       const dupCid = cid();
       await sockets[0]!.commit([putOp(fileId(), null, pathKey())], { cid: dupCid });
-      const all = await Promise.all(sockets.flatMap((w) => Array.from({ length: 10 }, () => w.commit([putOp(fileId(), null, pathKey()), putOp(fileId(), null, pathKey())]))));
+      // 4 per socket = maxInFlightCommits (design §2.9.4); more would be refused RATE_LIMITED.
+      const all = await Promise.all(sockets.flatMap((w) => Array.from({ length: 4 }, () => w.commit([putOp(fileId(), null, pathKey()), putOp(fileId(), null, pathKey())]))));
       const seqs = all.flatMap((r) => r.results.map((x) => (x as { seqs: number[] }).seqs[0]!)).sort((a, b) => a - b);
-      expect(seqs).toHaveLength(80);
-      expect(new Set(seqs).size).toBe(80);
-      expect(seqs[79]! - seqs[0]!).toBe(79);
+      expect(seqs).toHaveLength(32);
+      expect(new Set(seqs).size).toBe(32);
+      expect(seqs[31]! - seqs[0]!).toBe(31);
       // Same cid, different digest, queued together with good commits: only that socket fails.
       const rid = sockets[0]!.nextRid();
       sockets[0]!.send({ type: "commit", rid, cid: dupCid, ops: [putOp(fileId(), null, pathKey())] });

@@ -14,7 +14,7 @@ import {
 } from "@shuttle/protocol";
 import type {
   AuthResponse, ChangesResponse, CreateVaultResponse, DeviceDescriptor, DeviceInfo, EnrollCodeResponse, ErrorBody,
-  HealthResponse, MeResponse, PackEntry, SnapshotReason, SnapshotResponse, UserInfo, Validation, VaultSummary,
+  HealthResponse, MeResponse, PackEntry, SnapshotReason, SnapshotResponse, UserInfo, Validation, VaultSummary, WelcomeLimits,
 } from "@shuttle/protocol";
 import { enrollCodeHash, newEnrollCode, normalizeEnrollCode, verifyPassword } from "./auth";
 import { looksSealed } from "./blobs";
@@ -157,7 +157,11 @@ async function route(srv: Server, c: Ctx): Promise<void> {
   const m = c.method;
   if (a === "health" && seg.length === 2) {
     if (m !== "GET") methodNotAllowed();
-    const body: HealthResponse = { ok: true, server: srv.version, protocols: [...SUPPORTED_PROTOCOLS], time: Date.now(), source: srv.cfg.sourceUrl };
+    // `limits` is additive (not yet in the protocol's HealthResponse): adapters learn them before subscribe.
+    const body: HealthResponse & { limits: WelcomeLimits } = {
+      ok: true, server: srv.version, protocols: [...SUPPORTED_PROTOCOLS], time: Date.now(), source: srv.cfg.sourceUrl,
+      limits: { ...srv.cfg.limits },
+    };
     return sendJson(c.res, 200, body);
   }
   if (a === "auth" && seg.length === 3) {
@@ -173,7 +177,9 @@ async function route(srv: Server, c: Ctx): Promise<void> {
   const au = authenticate(srv, c);
   if (a === "me" && seg.length === 2) {
     if (m !== "GET") methodNotAllowed();
-    const body: MeResponse = { user: userInfo(au.user), device: deviceInfo(au.device, au.device.device_id) };
+    const body: MeResponse & { limits: WelcomeLimits } = {
+      user: userInfo(au.user), device: deviceInfo(au.device, au.device.device_id), limits: { ...srv.cfg.limits },
+    };
     return sendJson(c.res, 200, body);
   }
   if (a === "enroll-codes" && seg.length === 2) {

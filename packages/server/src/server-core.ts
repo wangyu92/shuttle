@@ -57,7 +57,7 @@ export class Server {
     this.db = openDb(path.join(d, "shuttle.db"));
     this.s = new Stmts(this.db);
     this.store = new Store(this.s, cfg.now, cfg.limits);
-    this.blobs = new BlobStore(d, this.s, cfg.now);
+    this.blobs = new BlobStore(d, this.s, cfg.now, (vid, delta) => this.store.stored.add(vid, delta));
     this.hub = new Hub(cfg.coalesceMs);
     this.hwm = new HwmWriter(this.s, d, cfg.log);
     this.loginLimiter = new FailureLimiter(cfg.rates.loginFailuresPerMin, MINUTE_MS, cfg.now);
@@ -160,15 +160,22 @@ export class Server {
             results.push(this.store.commitInTx(it.vid, it.deviceId, it.req, it.expectEpoch));
             this.db.exec("RELEASE c");
           } catch (e) {
+            // The commit's own writes (and any cached usage delta) are undone; the others in the group stay.
+            this.store.stored.drop(it.vid);
             this.db.exec("ROLLBACK TO c");
             this.db.exec("RELEASE c");
             results.push(e instanceof Error ? e : new Error(String(e)));
           }
+          // SQLite rolls the whole transaction back on some errors (SQLITE_FULL, IOERR, NOMEM). Later
+          // statements would then autocommit one by one outside the group; abort the group instead so
+          // nothing is acked that the final COMMIT did not cover.
+          if (!this.db.isTransaction) throw new Error("group transaction was rolled back by SQLite");
         }
       });
     } catch (e) {
-      // The outer COMMIT failed: nothing of the batch is durable.
+      // The outer COMMIT (or the group) failed: nothing of the batch is durable, so nobody gets an ack.
       this.cfg.log(`group commit failed: ${String(e)}`);
+      for (const it of batch) this.store.stored.drop(it.vid);
       const err = new HttpError("SERVER", "commit failed");
       for (const it of batch) it.done(err);
       return;
@@ -235,6 +242,9 @@ export class Server {
       if (info.infoRev <= old.infoRev) throw new HttpError("INVALID", "infoRev did not increase");
       const json = JSON.stringify(info);
       const vid = cur.vault_id;
+      // design §2.11 step 3 drops versions, files, version_blobs and blob rows. `commits` and
+      // `device_cursors` go too (v1 is silent): a pre-rebuild cid must be re-evaluated against the new
+      // epoch, never answered `replayed:true` with seqs that no longer exist.
       for (const t of ["version_blobs", "versions", "files", "blobs", "commits", "device_cursors"]) {
         this.s.run(`DELETE FROM ${t} WHERE vault_id = ?`, vid);
       }
@@ -245,6 +255,7 @@ export class Server {
       this.s.run("DELETE FROM meta WHERE k = ?", `orphan_scan:${vid}`);
       return { epoch: info.epoch, headSeq: cur.head_seq };
     });
+    this.store.stored.drop(v.vault_id);
     this.hwm.mark(v.vault_id);
     void this.hwm.flushAll();
     this.parkVault(v.vault_id, "epoch");

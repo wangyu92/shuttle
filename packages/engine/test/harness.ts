@@ -5,7 +5,7 @@
 
 import { SxKeyring } from "@shuttle/crypto";
 import type { EngineHooks, Keyring, Scope, Subscription, VersionRecord } from "@shuttle/protocol";
-import { FakeClock, FakeRemoteServer, FakeScheduler, MemLocalFs, MemStateStore, Prng, TestIds, type FakeRemote } from "@shuttle/testkit";
+import { FakeClock, FakeKeyring, FakeRemoteServer, FakeScheduler, MemLocalFs, MemStateStore, Prng, TestIds, type FakeRemote } from "@shuttle/testkit";
 import {
   BlobPipeline, DirtySet, EchoSuppressor, Executor, FileIndex, Ingest, Journal, KeyedMutex, LocalRenames, OpRunner, Reconciler,
   RemoteApplier, WriteIntents, decodeRecord, markPendingLocalChanges, isConfigJson, isIllegal, kindOf, readAndHash, readMeta, retentionClassOf, scanLocal,
@@ -44,14 +44,14 @@ export interface World {
   ids: TestIds;
 }
 
-export async function makeWorld(seed = "world"): Promise<World> {
+export async function makeWorld(seed = "world", o: { fakeKeyring?: boolean } = {}): Promise<World> {
   const clock = new FakeClock();
   const server = new FakeRemoteServer({ clock, prng: new Prng(seed) });
   const ids = new TestIds(seed);
   const vmk = new Uint8Array(32);
   for (let i = 0; i < 32; i++) vmk[i] = (i * 37 + 11) & 0xff;
   const vaultId = ids.vaultId();
-  const ring = await SxKeyring.fromVmks(vaultId, new Map([[1, vmk]]), 1);
+  const ring: Keyring = o.fakeKeyring ? new FakeKeyring({ vaultId, secret: seed }) : await SxKeyring.fromVmks(vaultId, new Map([[1, vmk]]), 1);
   const boot = server.adapter("bootstrapdev0000000000");
   await boot.connect();
   const info = ids.vaultInfo({ vaultId });
@@ -165,7 +165,7 @@ export class Device {
       mirror: { upsert: (m) => { this.mirror.set(m.fileId, m); }, remove: (id) => { this.mirror.delete(id); }, list: () => [...this.mirror.values()] },
     });
     this.blobs = new BlobPipeline({ remote: this.remote, keyring: () => w.ring, params: () => TEST_PARAMS });
-    this.intents = new WriteIntents({ state: this.store, fs: this.fs });
+    this.intents = new WriteIntents({ state: this.store, fs: this.fs, now: () => this.w.clock.now() });
     this.renames = new LocalRenames({ index: this.index, scopeOf: this.scope, markDirty });
     this.applier = new RemoteApplier({
       fs: this.fs, state: this.store, index: this.index, journal: this.journal, blobs: this.blobs, intents: this.intents,

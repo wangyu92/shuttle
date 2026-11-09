@@ -53,6 +53,25 @@ export interface MemLocalFsOptions {
 }
 
 interface PendingFault { op: FsOp; code: LocalFsErrorCode; path?: string; skip: number }
+
+/** A non-atomic write that stops part-way (ops-spec §3 SimDevice "torn write"). */
+export interface TearSpec {
+  /** Only writes to this path (default: any write). */
+  path?: string;
+  /** Bytes of the new content that reach the disk (default: half, rounded down). */
+  keep?: number;
+  /** Fraction of the new content that reaches the disk (used when `keep` is absent). */
+  fraction?: number;
+  /** Skip this many matching writes first. */
+  skip?: number;
+  /**
+   * Called after the prefix is on disk, before the write fails (e.g. kill the state store to model
+   * a process death mid-write). If it throws, that error is what the write throws.
+   */
+  onTear?: (path: string) => void;
+  /** Error code of the failed write when onTear does not throw (default EIO). */
+  code?: LocalFsErrorCode;
+}
 type BeforeHook = (op: FsOp, path: string) => void | Promise<void>;
 
 const enc = new TextEncoder();
@@ -85,6 +104,9 @@ export class MemLocalFs implements LocalFs {
   private nextIno = 1;
   private listeners = new Set<(e: LocalEvent) => void>();
   private faults: PendingFault[] = [];
+  private tears: TearSpec[] = [];
+  /** Every torn write so far: path and the prefix length left on disk. */
+  readonly torn: Array<{ path: string; kept: number; of: number }> = [];
   private beforeHooks: BeforeHook[] = [];
   private eventsPaused = false;
   private heldEvents: LocalEvent[] = [];
@@ -144,6 +166,20 @@ export class MemLocalFs implements LocalFs {
   before(hook: BeforeHook): Disposable {
     this.beforeHooks.push(hook);
     return { dispose: () => { this.beforeHooks = this.beforeHooks.filter((h) => h !== hook); } };
+  }
+
+  /**
+   * Tear the next matching write: only a prefix of the new bytes lands (mtime updated, no event,
+   * as when the process dies or the disk fails mid-write on a platform without atomic writes),
+   * then the write throws (see TearSpec.onTear). Writes through processText are not torn.
+   */
+  tearNextWrite(spec: TearSpec = {}): void {
+    this.tears.push({ ...spec });
+  }
+
+  /** Pending tear specs (tests assert they were consumed). */
+  get pendingTears(): number {
+    return this.tears.length;
   }
 
   /** Change `path` externally right before its next read (torn read). */
@@ -376,6 +412,21 @@ export class MemLocalFs implements LocalFs {
 
   async write(path: string, data: Uint8Array, opts: { mtime: number; ctime?: number }): Promise<LocalStat> {
     await this.enter("write", path);
+    const ti = this.tears.findIndex((t) => t.path === undefined || this.key(t.path) === this.key(path));
+    if (ti >= 0) {
+      const t = this.tears[ti] as TearSpec;
+      if ((t.skip ?? 0) > 0) t.skip = (t.skip ?? 0) - 1;
+      else {
+        this.tears.splice(ti, 1);
+        const keep = Math.max(0, Math.min(data.length, t.keep ?? Math.floor(data.length * (t.fraction ?? 0.5))));
+        // The prefix lands without an event: nobody is alive to see one.
+        this.writeRaw(path, data.subarray(0, keep), opts.mtime, opts.ctime, this.writeCreatesParents, []);
+        this.stats.writes++;
+        this.torn.push({ path: nfc(path), kept: keep, of: data.length });
+        t.onTear?.(path);
+        throw new LocalFsError(t.code ?? "EIO", path, `torn write of ${path} (${keep} of ${data.length} bytes)`);
+      }
+    }
     const events: LocalEvent[] = [];
     const n = this.writeRaw(path, data, opts.mtime, opts.ctime, this.writeCreatesParents, events);
     this.stats.writes++;

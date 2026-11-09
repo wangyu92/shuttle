@@ -114,6 +114,16 @@ export class SpikeSettingTab extends PluginSettingTab {
         }),
       );
     new Setting(containerEl)
+      .setName("Server token")
+      .setDesc("Paste a device token (sxd_…) or a one-time enroll code (SXE-…, from shuttle-admin enroll-code). An enroll code is exchanged for a device token on the first server probe. Probes use the vault \"shuttle-spike\" and create it if missing.")
+      .addText((t) => {
+        t.inputEl.type = "password";
+        t.setValue(this.plugin.settings.serverToken).onChange(async (v) => {
+          this.plugin.settings.serverToken = v.trim();
+          await this.plugin.saveSettings();
+        });
+      });
+    new Setting(containerEl)
       .setName("Device name")
       .setDesc(`Used in the results file name. Empty = platform default (${this.plugin.defaultDeviceName()}).`)
       .addText((t) =>

@@ -164,6 +164,9 @@ export class RemoteApplier {
 
   /** Torn engine write at `path` (design §3.8.4 `applier.reapply`): rewrite R. Caller holds the locks. */
   async reapply(path: string): Promise<ApplyOutcome> {
+    // D1: an interrupted merge write is re-applied from its staged bytes, never from the remote head.
+    const m = await this.recoverMerge(path);
+    if (m !== null) return m;
     const i = await this.d.intents.get(path);
     if (!i) return "noop";
     const R = this.d.index.remote.byFileId(i.fileId);
@@ -177,6 +180,18 @@ export class RemoteApplier {
       return "gone";
     }
     return this.applyLocked(i.fileId, { planned: true, torn: path });
+  }
+
+  /** D1 merge-write recovery at `path` (null: the intent there is not a merge write). Caller holds the locks. */
+  private async recoverMerge(path: string): Promise<ApplyOutcome | null> {
+    const d = this.d;
+    const r = await d.intents.recoverMerge(path, (bytes, hash) => d.echo.expect(path, { hash, size: bytes.length }));
+    if (r === "none") return null;
+    await this.crash("apply:mergeRecovered");
+    if (r === "restored") d.log?.({ key: "log.tornMergeRestored", cat: "merge", path });
+    const e = d.index.byPath(path);
+    d.markDirty(e ? { fileId: e.fileId, path } : { path }, "retry");
+    return r === "restored" ? "applied" : "noop";
   }
 
   /** applyOne body; the caller holds the locks. */
@@ -213,7 +228,16 @@ export class RemoteApplier {
     const torn = opts.torn !== undefined && opts.torn === localPath;
     if (!torn && obs && !opts.planned) {
       const ic = await d.intents.check(localPath);
-      if (ic.c === "torn") return this.applyLocked(fileId, { ...opts, planned: true, torn: localPath });
+      if (ic.c === "torn") {
+        const m = await this.recoverMerge(localPath);
+        if (m !== null) {
+          // The restored merge is a local change against R: the Planner decides (it pushes it).
+          await this.removeQueue(fileId, R.seq);
+          d.markDirty(e ? { fileId, path: e.path } : { path: localPath }, "remote");
+          return "handoff";
+        }
+        return this.applyLocked(fileId, { ...opts, planned: true, torn: localPath });
+      }
     }
     const planned = opts.planned === true || torn;
 

@@ -33,7 +33,7 @@
     "test:e2e": "node -e \"console.log('test:e2e: no end-to-end suite until P1 (design §7)')\"",
     "lint": "tsc -b && node scripts/check-source-rules.mjs && node scripts/check-leaks.mjs",
     "check-no-native": "node scripts/check-no-native.mjs",
-    "sim": "node -e \"console.log('sim: @shuttle/sim has no runner until P1 (design §7)')\"",
+    "sim": "node --enable-source-maps packages/sim/bin/sim.mjs",
     "bench": "node -e \"console.log('bench: no benchmarks until P1; device numbers come from the spike (design §10.2)')\"",
     "dev:server": "node scripts/build.mjs server --dev && node dist/server/shuttle-server.mjs",
     "dev:plugin": "node scripts/build.mjs plugin --dev"

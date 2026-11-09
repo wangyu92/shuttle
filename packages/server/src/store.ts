@@ -50,6 +50,42 @@ export function recordBytes(r: VersionRecord): number {
   return JSON.stringify(r).length + 1;
 }
 
+/**
+ * Per-vault stored-bytes counter (blob rows plus inline bodies), so a commit does not run two SUMs over
+ * the vault. Filled lazily from SQL. Writers that add bytes call `add` (a no-op while the entry is not
+ * cached); everything that deletes rows or rolls a transaction back calls `drop`, and the next read
+ * recomputes. `drop` is always safe; a missing `add` or `drop` only skews the quota, never data.
+ */
+export class StoredBytes {
+  private cache = new Map<string, number>();
+  constructor(private readonly s: Stmts) {}
+
+  get(vid: string): number {
+    const c = this.cache.get(vid);
+    if (c !== undefined) return c;
+    const n = this.sum(vid);
+    this.cache.set(vid, n);
+    return n;
+  }
+
+  /** The uncached value (tests, admin). */
+  sum(vid: string): number {
+    const b = this.s.get<{ n: number | null }>("SELECT SUM(size) AS n FROM blobs WHERE vault_id = ?", vid)?.n ?? 0;
+    const i = this.s.get<{ n: number | null }>("SELECT SUM(length(inline)) AS n FROM versions WHERE vault_id = ? AND inline IS NOT NULL", vid)?.n ?? 0;
+    return b + i;
+  }
+
+  add(vid: string, delta: number): void {
+    const c = this.cache.get(vid);
+    if (c !== undefined && delta !== 0) this.cache.set(vid, c + delta);
+  }
+
+  /** Forget one vault, or every vault when `vid` is omitted. */
+  drop(vid?: string): void {
+    if (vid === undefined) this.cache.clear(); else this.cache.delete(vid);
+  }
+}
+
 /** Thrown for a same-cid / different-digest commit (design §2.9.5 X2). Maps to PROTOCOL. */
 export class CommitProtocolError extends Error {}
 
@@ -65,7 +101,11 @@ interface DecodedOp { meta: Buffer; inline: Buffer | null }
 export class Store {
   private infoCache = new Map<string, { etag: string; activeKv: number; retention: Required<Retention> }>();
 
-  constructor(readonly s: Stmts, private readonly now: () => number, private readonly limits: WelcomeLimits) {}
+  readonly stored: StoredBytes;
+
+  constructor(readonly s: Stmts, private readonly now: () => number, private readonly limits: WelcomeLimits) {
+    this.stored = new StoredBytes(s);
+  }
 
   // ---------------- vaults ----------------
 
@@ -166,11 +206,9 @@ export class Store {
     return { records, next: rows.length > limit ? records[records.length - 1]!.seq : null };
   }
 
-  /** Bytes stored for the vault: blob files plus inline bodies. Quota counts this. */
+  /** Bytes stored for the vault: blob files plus inline bodies. Quota counts this (cached, see StoredBytes). */
   storedBytes(vid: string): number {
-    const b = this.s.get<{ n: number | null }>("SELECT SUM(size) AS n FROM blobs WHERE vault_id = ?", vid)?.n ?? 0;
-    const i = this.s.get<{ n: number | null }>("SELECT SUM(length(inline)) AS n FROM versions WHERE vault_id = ? AND inline IS NOT NULL", vid)?.n ?? 0;
-    return b + i;
+    return this.stored.get(vid);
   }
 
   usage(vid: string): { liveBytes: number; historyBytes: number; blobCount: number; fileCount: number; largest: Array<{ fileId: string; encSize: number }> } {
@@ -228,7 +266,12 @@ export class Store {
    * are checked by the caller. Throws CommitProtocolError for a same-cid / different-digest resend.
    */
   commit(vid: string, deviceId: string, req: CommitRequest): CommitOutcome {
-    return txImmediate(this.s.db, () => this.commitInTx(vid, deviceId, req));
+    try {
+      return txImmediate(this.s.db, () => this.commitInTx(vid, deviceId, req));
+    } catch (e) {
+      this.stored.drop(vid);
+      throw e;
+    }
   }
 
   /**
@@ -416,6 +459,7 @@ class CommitPlan {
     this.st.s.run(
       `INSERT INTO versions (vault_id, seq, file_id, path_key, base_seq, kind, rc, kv, meta, inline, enc_size, device_id, ts, cid)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, ...args);
+    if (dec.inline) this.st.stored.add(vid, dec.inline.length);
     blobs.forEach((b, ord) => this.st.s.run("INSERT INTO version_blobs (vault_id, seq, ord, blob_id) VALUES (?, ?, ?, ?)", vid, seq, ord, b));
     for (const b of new Set(blobs)) this.st.s.run("UPDATE blobs SET touched_at = ? WHERE vault_id = ? AND blob_id = ?", this.ts, vid, b);
     const rec: VersionRecord = {

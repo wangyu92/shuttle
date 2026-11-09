@@ -12,11 +12,17 @@
 //
 // Own records: a record whose cid belongs to a batch still in our journal is mirrored but not queued
 // for apply; the ack transaction marks the file synced (design §3.7.3, S18).
+//
+// headOf / liveHeadByPathKey (S3 CAS, design §2.10.3) answer from persisted state: the raw head record
+// of each fileId is kept in the `history` store next to the archive hints (one non-archive row per
+// fileId, the one whose seq equals the mirrored head) and reloaded by load() after a restart. A head
+// learned from our own ack before its record arrived is answered from the mirrored RemoteHead (exact
+// CAS fields; `meta` is not known there and is empty).
 
 import { checkRecordFreshness } from "@shuttle/crypto";
 import type {
-  ChangeBatch, ChangeSink, ConnectionState, FileId, Keyring, PathKey, RemoteAdapter, RemoteError, RemoteHead, Seq,
-  SnapshotRequiredInfo, VersionRecord,
+  ChangeBatch, ChangeSink, ConnectionState, FileId, Keyring, PathKey, RemoteAdapter, RemoteError, RemoteHead, RetentionClass, Seq,
+  SnapshotRequiredInfo, StateTx, VersionRecord,
 } from "@shuttle/protocol";
 import { IntegrityError, LockedError } from "../errors";
 import type { FileIndex, IndexWriter } from "../index/FileIndex";
@@ -42,6 +48,8 @@ export interface IngestDeps {
   onState?(state: ConnectionState, detail?: string): void;
   onError?(err: RemoteError): void;
   log?(e: { key: string; cat: 'error' | 'general'; params?: Record<string, string | number | boolean | null>; fileId?: FileId }): void;
+  /** Retention class of a path, for heads stored before they carried `rc` (headOf fallback). */
+  rcOf?(path: string): RetentionClass;
 }
 
 export interface Quarantined { rec: VersionRecord; reason: string; stage: string }
@@ -68,19 +76,24 @@ export class Ingest implements ChangeSink {
     // Locked: reject, so the adapter does not ack; the batch is re-delivered after unlock.
     const ring = this.ring();
     const heads = new Map<FileId, RemoteHead>();
+    const raws = new Map<FileId, VersionRecord>();
     const hist: VersionRecord[] = [];
     const bad: Quarantined[] = [];
     for (const rec of batch.records) {
       const known = heads.get(rec.fileId) ?? this.d.index.remote.byFileId(rec.fileId);
       try {
-        if (checkRecordFreshness(rec, known) === "ignore") continue;
+        if (checkRecordFreshness(rec, known) === "ignore") {
+          // Our own acked head arriving through the feed: keep its raw record for headOf.
+          if (rec.kind !== "archive" && known && known.seq === rec.seq && this.raw.get(rec.fileId)?.seq !== rec.seq) raws.set(rec.fileId, rec);
+          continue;
+        }
         const dec = await decodeRecord(ring, rec);
         if (dec.head === null) {
           hist.push(rec);
           continue;
         }
         heads.set(rec.fileId, dec.head);
-        this.rememberRaw(rec);
+        raws.set(rec.fileId, rec);
       } catch (err) {
         bad.push({ rec, reason: reasonOf(err), stage: stageOf(err) });
       }
@@ -88,6 +101,7 @@ export class Ingest implements ChangeSink {
     await crashPoint(this.d.hooks, "ingest:decoded");
     const queued: FileId[] = [];
     const held: FileId[] = [];
+    let stored: VersionRecord[] = [];
     await this.d.index.write(["applyQueue", "history", "integrity", "meta", "batches"], async (w) => {
       const tx = w.tx;
       for (const h of heads.values()) {
@@ -98,6 +112,7 @@ export class Ingest implements ChangeSink {
         queued.push(h.fileId);
       }
       for (const r of hist) await tx.history.put(r);
+      stored = await storeRawHeadsIn(w, raws.values());
       for (const q of bad) if (await quarantineIn(w, q)) held.push(q.rec.fileId);
       await purgeTombstonesIn(w, batch.minSeq);
       const cur = (await getMeta(tx, "cursor")) ?? 0;
@@ -108,20 +123,56 @@ export class Ingest implements ChangeSink {
       await setMeta(tx, "minSeq", batch.minSeq);
     });
     await crashPoint(this.d.hooks, "ingest:committed");
+    for (const r of stored) this.rememberRaw(r);
     for (const q of bad) this.d.log?.({ key: "log.integrityQuarantined", cat: "error", params: { seq: q.rec.seq, stage: q.stage }, fileId: q.rec.fileId });
     this.d.onSeen?.(batch.headSeq);
     if (queued.length > 0 || held.length > 0) this.d.kick?.("remote");
   }
 
+  /** Reload the raw head records from the state store (engine start, after a restart). */
+  async load(): Promise<number> {
+    const rows = await this.d.index.state.tx(["history"], (tx) => tx.history.getAll(), "readonly");
+    this.raw.clear();
+    this.rawByPk.clear();
+    let n = 0;
+    for (const rec of rows) {
+      if (rec.kind === "archive") continue;
+      const R = this.d.index.remote.byFileId(rec.fileId);
+      if (!R || R.seq !== rec.seq) continue;
+      this.rememberRaw(rec);
+      n++;
+    }
+    return n;
+  }
+
+  /**
+   * The current materialized head of `fileId` (design §2.12 ChangeSink.headOf): the mirrored head's
+   * raw record when known, else a record built from the persisted RemoteHead. Never a stale record:
+   * the answer always has the mirrored head's seq.
+   */
   headOf(fileId: FileId): VersionRecord | null {
-    return this.raw.get(fileId) ?? null;
+    const R = this.d.index.remote.byFileId(fileId);
+    if (!R) return null;
+    const raw = this.raw.get(fileId);
+    if (raw && raw.seq === R.seq) return raw;
+    return this.recordOf(R);
   }
 
   liveHeadByPathKey(pk: PathKey): VersionRecord | null {
-    const id = this.rawByPk.get(pk);
-    if (!id) return null;
-    const r = this.raw.get(id);
-    return r && r.kind === "put" && r.pathKey === pk ? r : null;
+    const R = this.d.index.remote.liveByPathKey(pk);
+    return R && !R.deleted ? this.headOf(R.fileId) : null;
+  }
+
+  /** VersionRecord view of a mirrored head (CAS fields exact; meta ciphertext unknown, encSize 0). */
+  private recordOf(R: RemoteHead): VersionRecord {
+    const rec: VersionRecord = {
+      seq: R.seq, fileId: R.fileId, pathKey: R.pathKey, base: R.base, kind: R.deleted ? "del" : "put",
+      rc: R.rc ?? this.d.rcOf?.(R.path) ?? "note", kv: R.kv, meta: "", blobs: R.deleted ? [] : [...R.blobs], encSize: 0,
+      device: R.deviceId, ts: R.ts,
+    };
+    if (R.cid !== undefined) rec.cid = R.cid;
+    if (!R.deleted && R.inline !== undefined) rec.inline = R.inline;
+    return rec;
   }
 
   onSnapshotRequired(info: SnapshotRequiredInfo): void {
@@ -140,9 +191,9 @@ export class Ingest implements ChangeSink {
     this.d.onError?.(err);
   }
 
-  private rememberRaw(rec: VersionRecord): void {
+  private rememberRaw(rec: VersionRecord, replace = false): void {
     const prev = this.raw.get(rec.fileId);
-    if (prev && prev.seq >= rec.seq) return;
+    if (prev && prev.seq >= rec.seq && !replace) return;
     if (prev && this.rawByPk.get(prev.pathKey) === rec.fileId) this.rawByPk.delete(prev.pathKey);
     this.raw.set(rec.fileId, rec);
     if (rec.kind === "put") this.rawByPk.set(rec.pathKey, rec.fileId);
@@ -157,6 +208,7 @@ export class Ingest implements ChangeSink {
   async snapshotResync(mode: ResyncMode): Promise<ResyncResult> {
     const ring = this.ring();
     const map = new Map<FileId, RemoteHead>();
+    const raws = new Map<FileId, VersionRecord>();
     const bad: Quarantined[] = [];
     let token: string | null = null;
     let firstHead: Seq | null = null;
@@ -167,7 +219,7 @@ export class Ingest implements ChangeSink {
         firstHead = page.headSeq;
         minSeq = page.minSeq;
       }
-      for (const rec of page.records) await this.decodeInto(ring, rec, map, bad);
+      for (const rec of page.records) await this.decodeInto(ring, rec, map, bad, raws);
       token = page.next;
       if (!token) break;
     }
@@ -178,7 +230,7 @@ export class Ingest implements ChangeSink {
         if (rec.kind === "archive") continue;
         const known = map.get(rec.fileId) ?? null;
         if (known && rec.seq <= known.seq) continue;
-        await this.decodeInto(ring, rec, map, bad);
+        await this.decodeInto(ring, rec, map, bad, raws);
       }
       minSeq = b.minSeq;
       cursor = Math.max(cursor, b.to);
@@ -188,7 +240,8 @@ export class Ingest implements ChangeSink {
     const changed: FileId[] = [];
     const purged: FileId[] = [];
     const replace = mode === "epoch" || mode === "rollback" || mode === "rebuild";
-    await this.d.index.write(["applyQueue", "integrity", "meta"], async (w) => {
+    let stored: VersionRecord[] = [];
+    await this.d.index.write(["applyQueue", "integrity", "meta", "history"], async (w) => {
       const tx = w.tx;
       for (const h of map.values()) {
         const prev = w.remote(h.fileId);
@@ -204,14 +257,22 @@ export class Ingest implements ChangeSink {
         if (!replace && prev.seq > (firstHead ?? 0)) continue;
         await w.deleteRemote(prev.fileId);       // XS-08: purged on the remote
         await tx.applyQueue.delete(prev.fileId);
+        await dropRawHeadsIn(tx, prev.fileId, Infinity);
         purged.push(prev.fileId);
       }
+      stored = await storeRawHeadsIn(w, raws.values());
       for (const q of bad) await quarantineIn(w, q);
       await setMeta(tx, "cursor", cursor);
       await setMeta(tx, "cursorAt", this.d.now());
       await setMeta(tx, "minSeq", minSeq);
     });
     await crashPoint(this.d.hooks, "resync:committed");
+    for (const id of purged) {
+      const old = this.raw.get(id);
+      if (old && this.rawByPk.get(old.pathKey) === id) this.rawByPk.delete(old.pathKey);
+      this.raw.delete(id);
+    }
+    for (const r of stored) this.rememberRaw(r, true);
     for (const id of [...changed, ...purged]) {
       const e = this.d.index.byFileId(id);
       if (e) this.d.markDirty({ fileId: id, path: e.path }, "remote");
@@ -221,13 +282,15 @@ export class Ingest implements ChangeSink {
     return { changed, purged, cursor, quarantined: bad.length };
   }
 
-  private async decodeInto(ring: Keyring, rec: VersionRecord, map: Map<FileId, RemoteHead>, bad: Quarantined[]): Promise<void> {
+  private async decodeInto(ring: Keyring, rec: VersionRecord, map: Map<FileId, RemoteHead>, bad: Quarantined[], raws: Map<FileId, VersionRecord>): Promise<void> {
     try {
       const dec = await decodeRecord(ring, rec);
       if (dec.head) {
         const prev = map.get(rec.fileId);
-        if (!prev || prev.seq < dec.head.seq) map.set(rec.fileId, dec.head);
-        this.rememberRaw(rec);
+        if (!prev || prev.seq < dec.head.seq) {
+          map.set(rec.fileId, dec.head);
+          raws.set(rec.fileId, rec);
+        }
       }
     } catch (err) {
       bad.push({ rec, reason: reasonOf(err), stage: stageOf(err) });
@@ -237,6 +300,30 @@ export class Ingest implements ChangeSink {
 
 function sameHead(a: RemoteHead, b: RemoteHead): boolean {
   return a.seq === b.seq && a.deleted === b.deleted && a.contentHash === b.contentHash && a.path === b.path;
+}
+
+/**
+ * Persist raw head records whose seq equals the mirrored head (after this transaction's upserts), and
+ * drop that fileId's older raw heads. Archive hints are never touched. Returns the records stored.
+ */
+async function storeRawHeadsIn(w: IndexWriter, recs: Iterable<VersionRecord>): Promise<VersionRecord[]> {
+  const out: VersionRecord[] = [];
+  for (const rec of recs) {
+    if (rec.kind === "archive") continue;
+    const R = w.remote(rec.fileId);
+    if (!R || R.seq !== rec.seq) continue;
+    await dropRawHeadsIn(w.tx, rec.fileId, rec.seq);
+    await w.tx.history.put(rec);
+    out.push(rec);
+  }
+  return out;
+}
+
+/** Delete the raw head records (not archives) of `fileId` with seq below `below`. */
+async function dropRawHeadsIn(tx: StateTx, fileId: FileId, below: Seq): Promise<void> {
+  for (const r of await tx.history.getAll({ index: "fileId", only: fileId })) {
+    if (r.kind !== "archive" && r.seq < below) await tx.history.delete(r.seq);
+  }
 }
 
 /** Integrity row + integrity hold on the entry (design §4.9.1 REJECT, §4.14). Returns true if an entry is held. */
@@ -262,6 +349,7 @@ async function purgeTombstonesIn(w: IndexWriter, minSeq: Seq): Promise<void> {
     if (w.entry(h.fileId)) continue;
     if ((await tx.applyQueue.get(h.fileId)) !== undefined) continue;
     await w.deleteRemote(h.fileId);
+    await dropRawHeadsIn(tx, h.fileId, Infinity);
   }
 }
 

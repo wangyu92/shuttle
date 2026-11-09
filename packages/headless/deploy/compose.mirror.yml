@@ -1,0 +1,30 @@
+# Production mirror next to the server (design §6.1.11). This is a FRAGMENT of the server's compose
+# file (design §2.8.9): `shuttle-server` and the `shuttle` network are defined there. Placeholders: replace /path/to/... and the
+# uid:gid before use. The data mount is the PARENT of the vault (vault = /data/vault, temp =
+# /data/.shuttle-tmp): rename(2) across two bind mounts fails with EXDEV, so temp and vault must share it.
+# Create beforehand: <data>/.shuttle-tmp (775) and <state>/{secret (700),guards,backup}.
+services:
+  shuttle-mirror:
+    image: shuttle-headless:0.1.0
+    container_name: shuttle-mirror
+    restart: unless-stopped
+    user: "1000:1000"
+    environment:
+      SHUTTLE_PROD: "1"                                  # design §7.8: required to touch the real vault
+      NODE_OPTIONS: --max-old-space-size=320
+      TZ: UTC
+    volumes:
+      - /path/to/data:/data                              # vault = /data/vault, temp = /data/.shuttle-tmp
+      - /path/to/mirror-state:/state                     # headless.json, state.db, secret/, guards/, health.json
+    mem_limit: 512m
+    ulimits: { core: 0 }
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+    healthcheck:
+      test: ["CMD", "shuttle-headless", "status", "--quiet", "--state", "/state"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+    stop_grace_period: 20s
+    depends_on: [shuttle-server]
+    networks: [shuttle]

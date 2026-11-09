@@ -21,7 +21,11 @@ export class BlobStore {
   readonly tmpDir: string;
   readonly graveyard: string;
 
-  constructor(readonly dataDir: string, private readonly s: Stmts, private readonly now: () => number) {
+  constructor(
+    readonly dataDir: string, private readonly s: Stmts, private readonly now: () => number,
+    /** Called after a new blob row landed, with the change in stored bytes (usage cache). */
+    private readonly onStoredDelta?: (vid: string, delta: number) => void,
+  ) {
     this.tmpDir = path.join(dataDir, "tmp");
     this.graveyard = path.join(dataDir, "graveyard");
   }
@@ -125,6 +129,8 @@ export class BlobStore {
       `INSERT INTO blobs (vault_id, blob_id, size, created_at, touched_at, state) VALUES (?, ?, ?, ?, ?, 'live')
        ON CONFLICT (vault_id, blob_id) DO UPDATE SET size = excluded.size, touched_at = excluded.touched_at, state = 'live'`,
       vid, blobId, size, t, t);
+    // A row without its file (restored DB) is overwritten: count only the size difference.
+    this.onStoredDelta?.(vid, size - (row?.size ?? 0));
     return "stored";
   }
 

@@ -20,10 +20,12 @@ import { Journal } from "./journal/Journal";
 import { OpRunner, type RunStats } from "./journal/OpRunner";
 import { backoffDelay } from "./journal/backoff";
 import { BlobPipeline, type ContentParams } from "./content/BlobPipeline";
+import { ChunkCache } from "./content/ChunkCache";
 import { readAndHash } from "./content/hash";
 import { WriteIntents } from "./apply/WriteIntents";
 import { RemoteApplier, type DrainStats } from "./apply/RemoteApplier";
 import { Ingest, type ResyncMode } from "./remote/ingest";
+import { withRequestTimeouts } from "./remote/timeouts";
 import { Executor } from "./reconcile/Executor";
 import { Reconciler, type ActionExecutor, type ExecContext, type ReconcileSettings } from "./reconcile/Reconciler";
 import type { Action, PlanCtx } from "./reconcile/Planner";
@@ -41,6 +43,7 @@ import { classifyStartup, mirrorPendingOp, unmirrorPendingOp, type LocalRecord, 
 import { isConfigJson, kindOf, retentionClassOf } from "./merge/MergePolicy";
 import { canonOfBytes } from "./merge/jsonMerge";
 import { DEFAULT_MERGE_OPTIONS, type MergeOptions } from "./merge/dmp3";
+import { ConflictLoopTracker } from "./merge/Oscillation";
 import { isIllegal, nameRulesFor } from "./path/illegal";
 import { PathFilter, defaultMaxFileBytes, type FilterSettings } from "./filter/PathFilter";
 import { DEFAULT_CONFIG_CATEGORIES, DEFAULT_PLUGIN_ID, isMobile } from "./filter/configCategories";
@@ -88,6 +91,9 @@ export interface SeenStore {
 
 export interface UnlockResult { ring: Keyring; pullOnly?: boolean }
 
+/** design §2.11 step 1 precheck counts. */
+export interface RebuildPrecheck { files: number; excluded: number; oversize: number; illegal: number; remoteOnly: number }
+
 export interface EngineOptions {
   settings?: Partial<DeviceSettings>;
   /** OS hint for desktop filename rules (path/illegal.ts nameRulesFor). */
@@ -121,6 +127,8 @@ export interface EngineOptions {
   headless?: boolean;
   /** No timers and no automatic loop runs: the caller drives runOnce() (tests, headless `--once`). Default false. */
   manual?: boolean;
+  /** design §3.7.4 per-request timeouts on the scheduler (default on; false only for adapters that time out themselves in tests). */
+  requestTimeouts?: boolean;
 }
 
 /** design §3.17 DeviceSettings defaults for this platform. */
@@ -209,7 +217,13 @@ export class ShuttleEngine implements Engine {
   readonly echo: EchoSuppressor;
   readonly locks = new KeyedMutex();
   readonly configSync: ConfigSync;
+  /** design §3.10.1 conflict-loop fallback (session state). */
+  readonly conflictLoops: ConflictLoopTracker;
+  /** design §3.15 chunk cache (disabled when the platform budget is 0: node). */
+  readonly chunkCache: ChunkCache;
 
+  /** deps.remote behind the per-request timeouts of design §3.7.4. */
+  readonly remote: EngineDeps["remote"];
   private ring: Keyring | null;
   private readonly local: LocalRecordStore;
   private readonly seenStore: SeenStore;
@@ -239,6 +253,10 @@ export class ShuttleEngine implements Engine {
   private planCtx: PlanCtx = { mode: "incremental" };
   private pendingResync: ResyncMode | null = null;
   private rebuildPending = false;
+  /** The pending epoch resync follows this device's own remote rebuild (no "rebuilt elsewhere" notice). */
+  private ownRebuild = false;
+  /** snapshotRequired{epoch} arrived: the next validated connect runs the epoch resync. */
+  private epochResyncAsked = false;
   private torn: Array<{ path: string; fileId: FileId }> = [];
   private scanDue: 'fast' | 'full' | null = "fast";
   private rescopeDue = false;
@@ -255,6 +273,8 @@ export class ShuttleEngine implements Engine {
   private parkedConflicts = new Map<string, DirtyKey>();
   private remoteDeleteApproved = false;
   private oversizeLogged = new Set<string>();
+  /** Dirty keys reached while Locked (design §3.13); re-marked on unlock. */
+  private heldWhileLocked = new Map<string, { key: DirtyKey; reason: DirtyReason }>();
 
   // loop state
   private running: Promise<void> | null = null;
@@ -276,6 +296,7 @@ export class ShuttleEngine implements Engine {
 
   constructor(readonly deps: EngineDeps, readonly opts: EngineOptions = {}) {
     const fs = deps.fs;
+    this.remote = opts.requestTimeouts === false ? deps.remote : withRequestTimeouts(deps.remote, deps.scheduler);
     this.settings = { ...defaultDeviceSettings(fs.platform), ...(opts.settings ?? {}) };
     this.settings.selective = { ...DEFAULT_SELECTIVE, ...(opts.settings?.selective ?? {}) };
     this.settings.configCategories = { ...DEFAULT_CONFIG_CATEGORIES, ...(opts.settings?.configCategories ?? {}) };
@@ -292,6 +313,8 @@ export class ShuttleEngine implements Engine {
     this.budget = new Budget(this.budgets, () => this.settings.maxFileBytes);
     this.guards = new GuardBoard(() => deps.clock.now(), (g) => this.emit("guard", g));
     this.echo = new EchoSuppressor(deps.clock);
+    this.conflictLoops = new ConflictLoopTracker(deps.clock);
+    this.chunkCache = new ChunkCache({ state: deps.state, capBytes: () => this.budgets.chunkCacheBytes, now: () => deps.clock.now() });
     this.filter = this.makeFilter();
     this.configSync = new ConfigSync(() => this.filter);
   }
@@ -355,6 +378,7 @@ export class ShuttleEngine implements Engine {
       this.lastError = "selfTest";
       this.log.add({ cat: "error", key: "log.selfTestFailed" });
     }
+    await this.ingest.load();
     this.torn = await this.intents.startupCheck();
     await this.runner.resume();
     markPendingLocalChanges(this.index, (k, r) => this.dirty.mark(k, r));
@@ -414,10 +438,10 @@ export class ShuttleEngine implements Engine {
   }
 
   async lock(): Promise<void> {
-    this.ring = null;
-    await this.closeRemote();
+    // The connection stays up (status paused/locked, design §3.13); the feed closes so no batch is
+    // rejected and retried while nothing can be opened. unlock() resubscribes from the cursor.
+    this.enterLocked("user");
     await this.opts.onKeysDropped?.();
-    this.log.add({ cat: "account", key: LOG_KEYS.locked });
     this.publishStatus();
   }
 
@@ -425,7 +449,7 @@ export class ShuttleEngine implements Engine {
     await this.ensureConnected();
     let info = this.vaultInfo;
     if (!info) {
-      const got = await this.deps.remote.getVaultInfo();
+      const got = await this.remote.getVaultInfo();
       info = got?.info ?? null;
     }
     if (!info) throw new LockedError("no vault-info on the remote");
@@ -435,15 +459,40 @@ export class ShuttleEngine implements Engine {
     if (r.pullOnly) this.setReadOnly(true);
     this.runner.keyVersionResolved();
     this.log.add({ cat: "account", key: LOG_KEYS.unlocked });
-    // The feed dropped while Locked (Ingest rejects batches): connect and subscribe again.
-    await this.closeRemote();
-    await this.ensureConnected();
+    // Keys held back while Locked are planned now (design §3.13: local events still collect).
+    for (const [, h] of this.heldWhileLocked) this.dirty.mark(h.key, h.reason);
+    this.heldWhileLocked.clear();
+    // The feed was closed while Locked: re-validate the vault-info with the keys, then resubscribe
+    // from the persisted cursor (no snapshot: nothing between the cursor and now was lost).
+    if (this.connected && this.connectInfo) {
+      await this.acceptVaultInfo(info, this.connectInfo);
+      if (!this.blocked() && this.ring !== null && !this.rebuildPending && this.pendingResync === null) {
+        const cursor = (await readMeta(this.deps.state, "cursor")) ?? 0;
+        this.subscribe(cursor);
+      }
+    } else {
+      await this.ensureConnected();
+    }
     this.kick("unlock");
     this.publishStatus();
   }
 
+  /** Enter the Locked state (design §3.13): drop the keyring and close the feed. */
+  private enterLocked(reason: string): void {
+    this.ring = null;
+    this.closeSub();
+    this.log.add({ cat: "account", key: LOG_KEYS.locked, ...(reason !== "user" ? { params: { reason } } : {}) });
+  }
+
+  /** A dirty key that could not be planned while Locked: kept until unlock, never re-spun. */
+  private holdLocked(key: DirtyKey, reason: DirtyReason): void {
+    this.heldWhileLocked.set(key.fileId ?? "p:" + key.path, { key, reason });
+  }
+
   kick(reason: string): void {
     if (this.stopped || !this.started || this.opts.manual) return;
+    // Locked: local events only collect (design §3.13); unlock() kicks the loop.
+    if (this.ring === null && reason === "local") return;
     if (this.loopRun) {
       // The running loop picks this up after its current iteration.
       this.rerun = true;
@@ -569,13 +618,104 @@ export class ShuttleEngine implements Engine {
           unpause();
           void this.ensureConnected();
         } else if (c === "rebuild") {
-          // Rebuilding the remote from this device (§3.13) is not available in this build: stay paused.
-          this.log.add({ cat: "error", key: "log.rebuildRemoteUnavailable" });
+          // design §3.13 / §2.11: rebuild the remote from this device. The precheck (§5.6.9) needs the
+          // user's second confirmation when files would disappear from the remote: then stay paused
+          // and ask again (the UI calls rebuildRemote({ confirmFiltered: true }) after its own prompt).
+          void this.rebuildRemote().catch((e: unknown) => {
+            this.log.add({ cat: "error", key: "log.rebuildRemoteFailed", params: { error: errName(e) } });
+            if (this.guardPause === "rollback" || this.guardPause === null) {
+              this.guardPause = "rollback";
+              this.guards.raise("rollback", g.n, g.sample);
+              this.publishStatus();
+            }
+          });
         } else this.pause();
         return;
       default:
         return;
     }
+  }
+
+  /**
+   * design §2.11 step 1 / §5.6.9 precheck: what a remote rebuild from this device would leave out.
+   * `files` = active tracked files that will be uploaded; the others are absent from the new epoch
+   * until another device uploads them again.
+   */
+  rebuildPrecheck(): RebuildPrecheck {
+    const out: RebuildPrecheck = { files: 0, excluded: 0, oversize: 0, illegal: 0, remoteOnly: 0 };
+    if (!this.index) return out;
+    const local = new Set<FileId>();
+    for (const e of this.index.all()) {
+      if (e.scope === "active" && e.obs !== null) {
+        out.files++;
+        local.add(e.fileId);
+      } else if (e.scope === "excluded") out.excluded++;
+      else if (e.scope === "oversize") out.oversize++;
+      else if (e.scope === "illegal") out.illegal++;
+    }
+    for (const R of this.index.remote.all()) {
+      if (R.deleted || local.has(R.fileId)) continue;
+      const e = this.index.byFileId(R.fileId);
+      if (e && e.scope !== "active") continue;      // counted above by scope
+      out.remoteOnly++;
+    }
+    return out;
+  }
+
+  /**
+   * Rebuild the remote vault from this device (design §2.11, §4.11.5; engine API level of §5.6.9).
+   * markRebuild (same keys, epoch+1, infoRev+1, new MAC) → `remote.rebuild(info)` → this device
+   * adopts the new epoch and runs the epoch resync: the remote is empty, so every tracked file is
+   * pushed as a create with its own fileId (rows S8/C5 in epoch mode; absence never deletes, I28).
+   * Throws `RebuildNeedsConfirmation` when the precheck finds files the new epoch would lack and
+   * `confirmFiltered` is not set.
+   */
+  async rebuildRemote(o: { confirmFiltered?: boolean } = {}): Promise<RebuildPrecheck> {
+    const r = this.remote;
+    if (!this.started || this.stopped) throw new Error("engine not started");
+    if (!r.rebuild) throw new Error("UNSUPPORTED: the remote cannot be rebuilt");
+    if (this.tampered) throw new Error("tampered");
+    const ring = this.ring;
+    if (!ring) throw new LockedError();
+    const pre = this.rebuildPrecheck();
+    if (pre.excluded + pre.oversize + pre.illegal + pre.remoteOnly > 0 && o.confirmFiltered !== true) {
+      throw Object.assign(new Error("RebuildNeedsConfirmation"), { name: "RebuildNeedsConfirmation", precheck: pre });
+    }
+    while (this.running) await this.running.catch(() => undefined);
+    let done!: () => void;
+    const gate = new Promise<void>((res) => { done = res; });
+    this.running = gate;
+    try {
+      await this.ensureConnected();
+      if (!this.connectInfo) throw new Error("not connected");
+      const got = await r.getVaultInfo();
+      if (!got) throw new Error("no vault-info on the remote");
+      const next = await markRebuildInfo(ring, got.info);
+      const res = await r.rebuild(next);
+      this.log.add({ cat: "general", key: "log.rebuildRemote", params: { files: pre.files, epoch: res.epoch } });
+      // The new epoch belongs to this device: seen moves forward (rollback reference reset: the old
+      // maxSeq described the history we just replaced), the mirror is replaced by the epoch resync.
+      const seen = this.seenStore.load();
+      this.seenStore.save({
+        epoch: next.epoch, infoRev: next.infoRev, activeKv: Math.max(seen?.activeKv ?? 0, next.activeKv), maxSeq: 0,
+      });
+      this.vaultInfo = next;
+      this.connectInfo = { ...this.connectInfo, epoch: next.epoch };
+      if (this.guardPause === "rollback") {
+        this.guards.clear("rollback");
+        this.guardPause = null;
+      }
+      this.closeSub();
+      this.pendingResync = "epoch";
+      this.ownRebuild = true;
+      this.planCtx = { mode: "epoch" };
+    } finally {
+      this.running = null;
+      done();
+    }
+    this.kick("rebuildRemote");
+    this.publishStatus();
+    return pre;
   }
 
   async repair(fileId: FileId): Promise<void> {
@@ -607,7 +747,7 @@ export class ShuttleEngine implements Engine {
   }
 
   debugInfo(): DebugInfo {
-    const r = this.deps.remote;
+    const r = this.remote;
     const c = this.counters;
     return {
       engineVersion: ENGINE_VERSION,
@@ -634,7 +774,7 @@ export class ShuttleEngine implements Engine {
   }
 
   async versions(fileId: FileId): Promise<VersionRecord[]> {
-    const r = this.deps.remote;
+    const r = this.remote;
     if (!r.listVersions) return [];
     const out: VersionRecord[] = [];
     let before: Seq | undefined;
@@ -768,14 +908,17 @@ export class ShuttleEngine implements Engine {
     this.index = this.indexOrThrow(now);
     this.journal = new Journal({ state: d.state, now, mirror });
     this.blobs = new BlobPipeline({
-      remote: d.remote, keyring: ringOrThrow,
+      remote: this.remote, keyring: ringOrThrow,
       params: () => {
         if (!this.params) throw new LockedError("content parameters unknown until the vault-info is read");
         return this.params;
       },
       budget: { acquire: (n) => this.budget.bytes.acquire(n), release: (n) => this.budget.bytes.release(n) },
+      uploadSlots: this.budget.uploadSlots,
+      downloadSlots: this.budget.downloadSlots,
+      ...(this.budgets.chunkCacheBytes > 0 ? { cache: this.chunkCache } : {}),
     });
-    this.intents = new WriteIntents({ state: d.state, fs });
+    this.intents = new WriteIntents({ state: d.state, fs, now });
     this.renames = new LocalRenames({ index: this.index, scopeOf: this.scopeOf, markDirty: this.markDirty });
     // The applier's own legality check logs the Sync string; let 'illegal' through the scope gate to it.
     const applierScope = (p: string, size?: number): Scope => {
@@ -793,22 +936,24 @@ export class ShuttleEngine implements Engine {
       log: this.toLog,
     });
     this.runner = new OpRunner({
-      state: d.state, index: this.index, journal: this.journal, remote: d.remote, keyring, fs, blobs: this.blobs, locks: this.locks, now,
+      state: d.state, index: this.index, journal: this.journal, remote: this.remote, keyring, fs, blobs: this.blobs, locks: this.locks, now,
       deviceId: () => this.connectInfo?.deviceId ?? this.local.load()?.deviceId ?? "", ...(hooks ? { hooks } : {}),
       markDirty: this.markDirty, rcOf, kindOf: kind, needsBase: this.needsBase,
       categoryOf: (p) => this.filter.categoryOf(p),
       batchMaxOps: this.budgets.commitBatchOps, ...(this.opts.random ? { random: this.opts.random } : {}),
-      onAcked: () => {
+      onAcked: (op) => {
         this.updateLocal((r) => (r.everSynced ? r : { ...r, everSynced: true }));
+        if (op.kind !== "archive") this.conflictLoops.recordSuccess(op.fileId);
         void this.renames.retry();
       },
+      onConflict: (fileId) => this.conflictLoops.recordConflict(fileId),
       onKeyVersion: () => { void this.refetchVaultInfo(); },
       onSnapshotRequired: () => { this.pendingResync ??= "epoch"; this.kick("snapshot"); },
       onArchiveFailed: (op, bytes) => this.writeArchiveFallback(op.path, bytes, op.fileId),
       log: this.toLog,
     });
     this.ingest = new Ingest({
-      index: this.index, keyring, remote: d.remote, now, ...(hooks ? { hooks } : {}), markDirty: this.markDirty,
+      index: this.index, keyring, remote: this.remote, now, ...(hooks ? { hooks } : {}), markDirty: this.markDirty,
       onSeen: (maxSeq) => this.noteSeen(maxSeq),
       kick: () => this.kick("remote"),
       onSnapshotRequired: (info) => this.onSnapshotRequired(info),
@@ -816,10 +961,11 @@ export class ShuttleEngine implements Engine {
       onState: (s, detail) => this.onConnState(s, detail),
       onError: (err) => this.onRemoteError(err),
       log: this.toLog,
+      rcOf,
     });
     this.executor = new Executor({
       fs, state: d.state, index: this.index, journal: this.journal, applier: this.applier, blobs: this.blobs, intents: this.intents,
-      remote: d.remote, keyring, echo: this.echo, now, ...(hooks ? { hooks } : {}), markDirty: this.markDirty, rcOf,
+      remote: this.remote, keyring, echo: this.echo, now, ...(hooks ? { hooks } : {}), markDirty: this.markDirty, rcOf,
       needsBase: this.needsBase, deviceName: () => this.settings.deviceName,
       ...(this.opts.tzOffset ? { tzOffset: this.opts.tzOffset } : {}),
       mergeOptions: this.mergeOpts,
@@ -835,12 +981,14 @@ export class ShuttleEngine implements Engine {
       hashFile: (p) => this.hashFile(p),
       settings: (): ReconcileSettings => ({ conflictMode: this.settings.conflictMode, mode: this.effectiveMode() }),
       ctx: () => this.planCtx, executor: guarded, markDirty: this.markDirty, isLocked: () => this.ring === null,
+      onLocked: (k) => this.holdLocked(k, "retry"),
       hooks: {
         isTorn: (p, st) => this.intents.isTorn(p, st),
         reapply: async (p) => { await this.applier.reapply(p); },
         acquireHash: (n) => this.budget.acquireHash(n),
         releaseHash: (n) => this.budget.releaseHash(n),
         renames: this.renames,
+        conflictLoop: (fileId) => this.conflictLoops.tripped(fileId),
       },
     });
     this.events = new LocalEventQueue({
@@ -1018,13 +1166,18 @@ export class ShuttleEngine implements Engine {
         }
         const fid = item.key.fileId ?? this.index.lookup(item.key)?.fileId;
         if (fid && this.parkedDeletes.has(fid)) continue;
+        if (this.ring === null) {
+          // Locked mid-pass (vault-info refetch): hold the rest without planning them.
+          this.holdLocked(item.key, item.reason);
+          continue;
+        }
         try {
-          await this.reconciler.reconcile(item.key);
-          n++;
+          const out = await this.reconciler.reconcile(item.key);
+          if (out.t !== "locked") n++;
         } catch (e) {
           if (e instanceof Error && (e.name === "Crash" || e.name === "StateStoreError")) throw e;
           if (isEngineError(e, "LOCKED")) {
-            retry.push(item);
+            this.holdLocked(item.key, item.reason);
             continue;
           }
           // design §3.11.5: stat errors and vanished files are re-checks, never uncaught exceptions.
@@ -1144,6 +1297,11 @@ export class ShuttleEngine implements Engine {
       }
     }
     await this.executor.execute(a, c);
+    // design §3.10.1: the tripped fallback applies to the NEXT resolution only.
+    if (c.ctx.conflictLoop && a.type === "MERGE") {
+      this.log.add({ cat: "merge", key: "log.conflictLoop", fileId: a.fileId, path: a.path });
+      this.conflictLoops.recordSuccess(a.fileId);
+    }
   }
 
   // ---------- filter changes (design §3.11) ----------
@@ -1207,7 +1365,9 @@ export class ShuttleEngine implements Engine {
       this.scanDue = "fast";
     } else {
       this.planCtx = { mode };
-      if (mode === "epoch" && res.changed.length + res.purged.length > EPOCH_INFO_MIN) {
+      const own = this.ownRebuild;
+      this.ownRebuild = false;
+      if (mode === "epoch" && !own && res.changed.length + res.purged.length > EPOCH_INFO_MIN) {
         this.log.add({ cat: "general", key: LOG_KEYS.epoch, params: { count: res.changed.length + res.purged.length } });
         this.guards.raise("epoch", res.changed.length + res.purged.length, []);
       }
@@ -1239,7 +1399,7 @@ export class ShuttleEngine implements Engine {
   }
 
   private async connect(): Promise<void> {
-    const r = this.deps.remote;
+    const r = this.remote;
     try {
       const ci = await r.connect();
       this.connectInfo = ci;
@@ -1262,6 +1422,11 @@ export class ShuttleEngine implements Engine {
         this.raiseRollback(mirrorEpoch, ci.epoch);
         this.connected = true;
         return;
+      }
+      if (this.epochResyncAsked) {
+        // The feed asked for an epoch snapshot and the vault-info checks above passed.
+        this.epochResyncAsked = false;
+        if (!this.rebuildPending) this.pendingResync ??= "epoch";
       }
       this.connected = true;
       this.reconnectAttempts = 0;
@@ -1289,16 +1454,22 @@ export class ShuttleEngine implements Engine {
     const ring = this.ring;
     if (ci && info.epoch !== ci.epoch) return this.markTampered("epochMismatch");
     if (ring) {
-      if (!(await ring.verifyVaultInfo(info).catch(() => false))) return this.markTampered("infoMac");
       if (!ring.kvs.includes(info.activeKv)) {
-        // design §3.13: active kv not in the key cache → Locked.
-        this.ring = null;
-        this.log.add({ cat: "account", key: LOG_KEYS.locked, params: { reason: "keyRotated" } });
+        // design §3.13 / §4.5.3 "from cache": the active kv is not cached → Locked. Its MAC is made
+        // with K_info(activeKv), which this device does not have, so it cannot be checked (that is not
+        // tampering); nothing of this info is accepted until unlock re-validates it with the new keys.
+        this.enterLocked("keyRotated");
+        this.vaultInfo = null;
+        return;
       }
+      if (!(await ring.verifyVaultInfo(info).catch(() => false))) return this.markTampered("infoMac");
     }
+    // design §4.5.3 step 8: infoRev, epoch and activeKv never go back.
     const seen = this.seenStore.load();
-    if (seen && info.infoRev < seen.infoRev) {
-      this.raiseRollback(seen.infoRev, info.infoRev);
+    if (seen && (info.infoRev < seen.infoRev || info.epoch < seen.epoch || info.activeKv < seen.activeKv)) {
+      if (info.infoRev < seen.infoRev) this.raiseRollback(seen.infoRev, info.infoRev);
+      else if (info.epoch < seen.epoch) this.raiseRollback(seen.epoch, info.epoch);
+      else this.raiseRollback(seen.activeKv, info.activeKv);
       return;
     }
     this.vaultInfo = info;
@@ -1332,8 +1503,27 @@ export class ShuttleEngine implements Engine {
     if (this.vaultInfoPending) return;
     this.vaultInfoPending = true;
     try {
-      const got = await this.deps.remote.getVaultInfo();
-      if (got) await this.acceptVaultInfo(got.info, this.connectInfo ? { ...this.connectInfo, epoch: got.info.epoch } : null);
+      const got = await this.remote.getVaultInfo();
+      const ci = this.connectInfo;
+      if (got && ci && got.info.epoch !== ci.epoch) {
+        // design §4.5.3 / §4.9.2: the welcome of THIS connection fixed the epoch. A refetched info with
+        // another epoch is never accepted against it. A newer epoch with a valid MAC is a rebuild on
+        // another device while we were connected: reconnect, so the fresh welcome is checked against
+        // the info (connect() then schedules the epoch resync). Anything else is tampering.
+        const ring = this.ring;
+        // Without the info's active key the MAC cannot be checked here; connect() then goes Locked.
+        const macOk = ring && ring.kvs.includes(got.info.activeKv) ? await ring.verifyVaultInfo(got.info).catch(() => false) : true;
+        const seen = this.seenStore.load();
+        if (got.info.epoch > ci.epoch && macOk && got.info.epoch > (seen?.epoch ?? 0)) {
+          this.log.add({ cat: "general", key: LOG_KEYS.epoch, params: { count: 0 } });
+          await this.closeRemote();
+          void this.ensureConnected();
+        } else {
+          this.markTampered("epochMismatch");
+        }
+        return;
+      }
+      if (got) await this.acceptVaultInfo(got.info, ci);
       this.runner.keyVersionResolved();
     } catch (e) {
       if (isRemoteError(e)) this.onRemoteError(e);
@@ -1366,7 +1556,7 @@ export class ShuttleEngine implements Engine {
         this.catchUpTimer = null;
         if (this.catchingUp) { this.catchingUp = false; this.kick("catchUpTimeout"); }
       });
-      this.sub = this.deps.remote.subscribe(cursor, sink);
+      this.sub = this.remote.subscribe(cursor, sink);
     } catch (e) {
       this.catchingUp = false;
       this.sub = null;
@@ -1387,7 +1577,7 @@ export class ShuttleEngine implements Engine {
     this.closeSub();
     if (!this.connected && !this.connectInfo) return;
     this.connected = false;
-    await this.deps.remote.close().catch(() => undefined);
+    await this.remote.close().catch(() => undefined);
     this.publishStatus();
   }
 
@@ -1395,7 +1585,7 @@ export class ShuttleEngine implements Engine {
     if (!this.connected) return;
     this.closeSub();
     this.connected = false;
-    void this.deps.remote.close().catch(() => undefined);
+    void this.remote.close().catch(() => undefined);
     this.log.add({ cat: "network", key: LOG_KEYS.disconnected });
     this.scheduleReconnect();
     this.publishStatus();
@@ -1432,8 +1622,14 @@ export class ShuttleEngine implements Engine {
     if (info.reason === "rollback") {
       const seen = this.seenStore.load();
       this.raiseRollback(seen?.maxSeq ?? 0, info.minSeq);
+    } else if (info.reason === "epoch") {
+      // design §2.11 step 5 / §4.5.3: a new epoch is accepted only through the MAC'd vault-info, and
+      // the welcome epoch must equal it. Reconnect (fresh welcome + vault-info check); connect()
+      // schedules the epoch resync once both agree, or goes tampered/rollback.
+      this.epochResyncAsked = true;
+      void this.closeRemote().then(() => this.ensureConnected());
     } else {
-      this.pendingResync = info.reason === "epoch" ? "epoch" : "snapshotResync";
+      this.pendingResync = "snapshotResync";
     }
     this.kick("snapshot");
     this.publishStatus();
@@ -1609,6 +1805,14 @@ function sanitizeName(s: string): string {
   let out = "";
   for (const ch of s) out += /[\\/:*?"<>|]/.test(ch) || ch.charCodeAt(0) < 0x20 ? "_" : ch;
   return out.slice(0, 64) || "device";
+}
+
+/** design §4.11.5 markRebuild over the protocol Keyring: verify the current MAC, epoch+1, infoRev+1, new MAC. */
+export async function markRebuildInfo(ring: Keyring, info: VaultInfo): Promise<VaultInfo> {
+  if (!(await ring.verifyVaultInfo(info))) throw new Error("TamperedVaultInfo");
+  const { infoMac: _m, ...rest } = info;
+  const next = { ...rest, epoch: info.epoch + 1, infoRev: info.infoRev + 1 };
+  return { ...next, infoMac: await ring.macVaultInfo(next as unknown as Parameters<Keyring["macVaultInfo"]>[0]) } as VaultInfo;
 }
 
 async function defaultSelfTest(): Promise<boolean> {

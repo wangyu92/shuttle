@@ -24,6 +24,7 @@ const LS = { session: "shuttle-spike-session", unload: "shuttle-spike-unload", m
 const DEFAULT_SETTINGS: SpikeSettings = {
   // §2.8.10 / §10.2 M4: the DSM reverse-proxy rule listens on 6984.
   serverUrl: "",
+  serverToken: "",
   deviceName: "",
   m7IdleMinutes: 10,
   postResults: false,
@@ -246,6 +247,7 @@ export default class ShuttleSpikePlugin extends Plugin {
         if (!this.progressNotice) this.progressNotice = new Notice(msg, 0);
         else this.progressNotice.setMessage(msg);
       },
+      saveSettings: () => this.saveSettings(),
       confirm: (t, b) => confirmModal(this.app, t, b),
       ask: (q, o) => (batch ? Promise.resolve(null) : askModal(this.app, q, o)),
       ensureFolder: (p) => this.ensureFolder(p),

@@ -530,6 +530,27 @@ describe("FakeRemote change feed", () => {
     expect(page.headSeq).toBe(1);   // head_seq is kept across rebuild (ID-10)
   });
 
+  it("rebuild (design §2.11): the rebuilding device's own feed stays live and its creates commit", async () => {
+    const { a, b, server, ids } = await setup();
+    await a.commit({ cid: ids.cid(), ops: [ids.put()] });
+    const own = new RecordingSink();
+    const other = new RecordingSink();
+    a.subscribe(1, own);
+    b.subscribe(1, other);
+    await server.settle();
+    const info = (await a.getVaultInfo())!.info;
+    await a.rebuild({ ...info, epoch: 2, infoRev: 2 });
+    await server.settle();
+    expect(other.snapshots.map((x) => x.reason)).toEqual(["epoch"]);
+    expect(own.snapshots).toEqual([]);
+    // step 4: upload as creates; the own feed delivers them from the kept head_seq.
+    const r = await a.commit({ cid: ids.cid(), ops: [ids.put()] });
+    expect(r.results[0]).toMatchObject({ ok: true, seqs: [2] });
+    await server.settle();
+    expect(own.batches.flatMap((x) => x.records.map((rec) => rec.seq))).toContain(2);
+    expect(server.devices.get(b.deviceId)?.ackedSeq ?? null).toBeNull();
+  });
+
   it("vault-info updates are CAS'd and broadcast", async () => {
     const { a, b, server } = await setup();
     const sink = new RecordingSink();

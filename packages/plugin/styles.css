@@ -1,1 +1,33 @@
-/* Shuttle styles. Placeholder. */
+/* SHUTTLE styles. Scoped to .shuttle-* classes; colors only through Obsidian CSS variables (design §5.11). */
+
+.shuttle-status-icon { display: inline-flex; align-items: center; }
+.shuttle-status-icon[data-state="notConfigured"] { color: var(--text-muted); }
+.shuttle-status-icon[data-state="locked"] { color: var(--color-orange); }
+.shuttle-status-icon[data-state="error"],
+.shuttle-status-icon[data-state="disconnected"] { color: var(--color-red); }
+.shuttle-status-icon[data-state="paused"],
+.shuttle-status-icon[data-state="syncing"] { color: var(--color-purple); }
+.shuttle-status-icon[data-state="synced"] { color: var(--color-green); }
+.shuttle-status-icon[data-state="syncing"] svg { animation: shuttle-spin 1s linear infinite; }
+@media (prefers-reduced-motion: reduce) {
+  .shuttle-status-icon[data-state="syncing"] svg { animation: none; }
+}
+@keyframes shuttle-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
+.shuttle-msg { margin: 0.5em 0; }
+.shuttle-error { color: var(--text-error); }
+.shuttle-banner { padding: 0.5em; margin-bottom: 0.5em; border-radius: var(--radius-s); background: var(--background-secondary); color: var(--text-muted); }
+.shuttle-step { color: var(--text-muted); font-size: var(--font-ui-small); margin-bottom: 0.5em; }
+.shuttle-checklist { list-style: none; padding-left: 0; font-size: var(--font-ui-small); }
+
+.shuttle-log-modal { width: min(720px, 95vw); }
+.shuttle-log-list { max-height: 70vh; overflow-y: auto; font-size: var(--font-ui-small); user-select: text; }
+.shuttle-log-row { display: flex; flex-wrap: wrap; gap: 0.5em; padding: 2px 0; border-bottom: 1px solid var(--background-modifier-border); }
+.shuttle-log-time, .shuttle-log-cat { color: var(--text-muted); font-family: var(--font-monospace); }
+.shuttle-log-error .shuttle-log-msg { color: var(--text-error); }
+.shuttle-log-path { color: var(--text-accent); word-break: break-all; }
+.shuttle-log-empty { color: var(--text-muted); padding: 1em 0; }
+
+.shuttle-code { font-family: var(--font-monospace); font-size: 1.4em; letter-spacing: 0.05em; margin: 0.5em 0; user-select: all; }
+.shuttle-preview { max-height: 50vh; overflow: auto; white-space: pre-wrap; font-size: var(--font-ui-small); user-select: text; }
+.shuttle-guard-sample { max-height: 30vh; overflow-y: auto; font-family: var(--font-monospace); font-size: var(--font-ui-small); }

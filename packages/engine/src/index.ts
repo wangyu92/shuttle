@@ -21,9 +21,11 @@ export * from "./path/illegal";
 export * from "./content/hash";
 export * from "./content/chunker";
 export * from "./content/BlobPipeline";
+export * from "./content/ChunkCache";
 
 export * from "./remote/records";
 export * from "./remote/ingest";
+export * from "./remote/timeouts";
 
 export * from "./journal/Journal";
 export * from "./journal/OpRunner";

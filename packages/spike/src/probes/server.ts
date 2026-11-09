@@ -1,6 +1,9 @@
-// Server probes M4..M8 against the P0 dev stub (packages/server/src/server.ts): GET /v1/health,
+// Server probes M4..M8 against the real server (packages/server, design §2.8, §2.9): GET /v1/health,
 // PUT/GET /v1/vaults/{vid}/blobs/{blobId}, WebSocket /v1/ws with subprotocol "shuttle.1".
-import { HEADER_SHA256, WS_PATH, WS_SUBPROTOCOL } from "@shuttle/protocol";
+// Auth (design §2.8.4): a device token pasted in the settings, or an enroll code swapped for one via
+// POST /v1/auth/enroll. Every probe works in its own vault "shuttle-spike", created on first use.
+import { HEADER_SHA256, VAULT_INFO_FORMAT, VAULT_INFO_FORMAT_VERSION, WS_PATH, WS_SUBPROTOCOL } from "@shuttle/protocol";
+import type { AuthResponse, CreateVaultResponse, VaultSummary } from "@shuttle/protocol";
 import { Platform, apiVersion, requestUrl } from "obsidian";
 import type { Ctx, Probe, ProbeOutcome } from "../types.js";
 import { KiB, MiB, b64u, errMsg, now, randomBytes, round, sha256hex, sleep, withTimeout } from "../util.js";
@@ -50,17 +53,95 @@ function skipped(ctx: Ctx, h: HealthResult): ProbeOutcome {
   return { status: "skipped", summary: `server unreachable (${base(ctx)}): ${h.error ?? "?"}`, data: { health: h } };
 }
 
-/** 16 random bytes as 22-char base64url, the stub's vaultId format. One per plugin session. */
-let spikeVaultId: string | null = null;
-function vaultId(): string {
+/** The vault every server probe writes into. Never a real vault: blobs here are random bytes. */
+const SPIKE_VAULT_NAME = "shuttle-spike";
+
+/** 16 random bytes as 22-char base64url (vaultId format, design §2.2). */
+function newVaultId(): string {
   for (;;) {
-    spikeVaultId ??= b64u(randomBytes(16));
-    if (/^[A-Za-z0-9_-]{21}[AQgw]$/.test(spikeVaultId)) return spikeVaultId;
-    spikeVaultId = null;
+    const id = b64u(randomBytes(16));
+    if (/^[A-Za-z0-9_-]{21}[AQgw]$/.test(id)) return id;
   }
 }
 
-/** A fake sealed blob: "SXB1", kv 1, flags 0, then random bytes. The stub only checks magic, length and sha256. */
+interface Session { url: string; token: string; vaultId: string }
+let session: Session | null = null;
+
+function authHeaders(s: Session): Record<string, string> {
+  return { Authorization: `Bearer ${s.token}` };
+}
+
+function bodyJson(r: { json: unknown }): Record<string, unknown> | null {
+  try {
+    const j = r.json as unknown;
+    return typeof j === "object" && j !== null ? (j as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
+
+function errCode(r: { status: number; json: unknown }): string {
+  const e = bodyJson(r)?.error as { code?: unknown; message?: unknown } | undefined;
+  return `HTTP ${r.status}${e && typeof e.code === "string" ? ` ${e.code}` : ""}${e && typeof e.message === "string" ? `: ${e.message}` : ""}`;
+}
+
+/**
+ * Token and spike vault for this server URL, cached per plugin session. An enroll code in the settings
+ * is redeemed once and replaced by the device token it returns (saved in the plugin data).
+ */
+export async function ensureSession(ctx: Ctx): Promise<Session> {
+  const url = base(ctx);
+  const raw = ctx.settings.serverToken.trim();
+  if (session && session.url === url && session.token === raw) return session;
+  if (raw === "") throw new SpikeAuthError("no server token in the spike settings (paste a device token or an enroll code)");
+  let token = raw;
+  if (!raw.startsWith("sxd_")) {
+    const r = await requestUrl({
+      url: `${url}/v1/auth/enroll`, method: "POST", contentType: "application/json", throw: false,
+      body: JSON.stringify({ code: raw, device: { name: ctx.settings.deviceName || "spike", platform: platformName(), clientVersion: `spike/${apiVersion}` } }),
+    });
+    if (r.status !== 200) throw new SpikeAuthError(`enroll failed: ${errCode(r)}`);
+    token = (r.json as AuthResponse).token;
+    ctx.settings.serverToken = token;
+    await ctx.saveSettings();
+  }
+  const s: Session = { url, token, vaultId: "" };
+  const list = await requestUrl({ url: `${url}/v1/vaults`, method: "GET", headers: authHeaders(s), throw: false });
+  if (list.status !== 200) throw new SpikeAuthError(`token rejected: ${errCode(list)}`);
+  const found = ((bodyJson(list)?.vaults ?? []) as VaultSummary[]).find((v) => v.name === SPIKE_VAULT_NAME);
+  if (found) s.vaultId = found.vaultId;
+  else {
+    const vaultId = newVaultId();
+    // The server stores vault-info opaquely (design §2.8.5); this one is a placeholder no client can unlock.
+    const info = {
+      format: VAULT_INFO_FORMAT, formatVersion: VAULT_INFO_FORMAT_VERSION, vaultId, createdAt: Date.now(),
+      infoRev: 1, epoch: 1, activeKv: 1, infoMac: "spike-placeholder", spike: true,
+    };
+    const r = await requestUrl({
+      url: `${url}/v1/vaults`, method: "POST", contentType: "application/json", headers: authHeaders(s), throw: false,
+      body: JSON.stringify({ name: SPIKE_VAULT_NAME, info }),
+    });
+    if (r.status !== 201) throw new SpikeAuthError(`could not create the vault "${SPIKE_VAULT_NAME}": ${errCode(r)}`);
+    s.vaultId = (r.json as CreateVaultResponse).vaultId;
+  }
+  session = s;
+  return s;
+}
+
+export class SpikeAuthError extends Error {}
+
+/** Health, then auth: a skipped outcome when either is missing, else the session. */
+async function ready(ctx: Ctx, fresh = false): Promise<{ h: HealthResult; s: Session } | ProbeOutcome> {
+  const h = await health(ctx, fresh);
+  if (!h.ok) return skipped(ctx, h);
+  try {
+    return { h, s: await ensureSession(ctx) };
+  } catch (e) {
+    return { status: e instanceof SpikeAuthError ? "skipped" : "fail", summary: `server auth: ${errMsg(e)}`, data: { health: h } };
+  }
+}
+
+/** A fake sealed blob: "SXB1", kv 1, flags 0, then random bytes. The server only checks magic, length and sha256. */
 function fakeBlob(size: number): Uint8Array<ArrayBuffer> {
   const b = randomBytes(size);
   b.set([0x53, 0x58, 0x42, 0x31, 1, 0], 0);
@@ -73,16 +154,16 @@ function lowerHeaders(h: Record<string, string>): Record<string, string> {
   return out;
 }
 
-async function putBlob(ctx: Ctx, body: Uint8Array<ArrayBuffer>) {
+async function putBlob(s: Session, body: Uint8Array<ArrayBuffer>) {
   const blobId = await sha256hex(body);
-  const url = `${base(ctx)}/v1/vaults/${vaultId()}/blobs/${blobId}`;
+  const url = `${s.url}/v1/vaults/${s.vaultId}/blobs/${blobId}`;
   const t0 = now();
   const r = await requestUrl({
     url,
     method: "PUT",
     body: body.buffer,
     contentType: "application/octet-stream",
-    headers: { [HEADER_SHA256]: blobId },
+    headers: { ...authHeaders(s), [HEADER_SHA256]: blobId },
     throw: false,
   });
   const h = lowerHeaders(r.headers);
@@ -113,6 +194,7 @@ interface WsSession {
 
 /** Opens /v1/ws, sends hello and waits for welcome. */
 export async function openWs(ctx: Ctx, timeoutMs = 5000): Promise<WsSession> {
+  const auth = await ensureSession(ctx);
   const t0 = now();
   const ws = new WebSocket(wsUrl(ctx), [WS_SUBPROTOCOL]);
   const session: Partial<WsSession> & { closeInfo: WsSession["closeInfo"] } = { ws, closeInfo: null };
@@ -151,8 +233,8 @@ export async function openWs(ctx: Ctx, timeoutMs = 5000): Promise<WsSession> {
           type: "hello",
           rid: 1,
           proto: 1,
-          token: "sxd_spike",
-          vaultId: vaultId(),
+          token: auth.token,
+          vaultId: auth.vaultId,
           since: null,
           epoch: null,
           seenMaxSeq: null,
@@ -211,17 +293,18 @@ export const serverProbes: Probe[] = [
     safe: true,
     needsServer: true,
     async run(ctx): Promise<ProbeOutcome> {
-      const h = await health(ctx);
-      if (!h.ok) return skipped(ctx, h);
+      const rd = await ready(ctx);
+      if (!("s" in rd)) return rd;
+      const { h, s } = rd;
       ctx.progress("M4: PUT 4 MiB");
       const body = fakeBlob(4 * MiB);
-      const put = await putBlob(ctx, body);
+      const put = await putBlob(s, body);
       if (put.status !== 201 && put.status !== 200) {
         return { status: "fail", summary: `PUT HTTP ${put.status} ${put.text}`, data: { put, net: netInfo() } };
       }
       ctx.progress("M4: GET 4 MiB");
       const t0 = now();
-      const r = await requestUrl({ url: put.url, method: "GET", throw: false });
+      const r = await requestUrl({ url: put.url, method: "GET", headers: authHeaders(s), throw: false });
       const getMs = round(now() - t0);
       const match = r.status === 200 && (await sha256hex(r.arrayBuffer)) === put.blobId;
       const data = { healthMs: h.ms, putMs: put.ms, putStatus: put.status, getMs, getStatus: r.status, hashMatch: match, net: netInfo() };
@@ -239,17 +322,18 @@ export const serverProbes: Probe[] = [
     safe: true,
     needsServer: true,
     async run(ctx): Promise<ProbeOutcome> {
-      const h = await health(ctx);
-      if (!h.ok) return skipped(ctx, h);
-      // The stub has no pack endpoint and caps blobs at 4 MiB + 1 KiB itself, so this measures where a
-      // 413 comes from (fromShuttle = the stub answered; otherwise a proxy such as DSM nginx).
+      const rd = await ready(ctx);
+      if (!("s" in rd)) return rd;
+      const { s } = rd;
+      // The server caps a blob at maxBlobSize (4 MiB + 1 KiB) itself, so this measures where a 413 comes
+      // from (fromShuttle = the server answered; otherwise a proxy such as DSM nginx).
       const sizes = [8 * MiB, 6 * MiB, 4 * MiB + KiB, 4 * MiB];
       const tries: Record<string, unknown>[] = [];
       let largestPass = 0;
       for (const size of sizes) {
         ctx.progress(`M5: PUT ${size} B`);
         try {
-          const p = await putBlob(ctx, fakeBlob(size));
+          const p = await putBlob(s, fakeBlob(size));
           tries.push({ size, status: p.status, fromShuttle: p.fromShuttle, ms: p.ms, text: p.text });
           if (p.status < 300) {
             largestPass = Math.max(largestPass, size);
@@ -265,7 +349,7 @@ export const serverProbes: Probe[] = [
       const through8 = !!t8 && typeof t8.status === "number" && (t8.status < 300 || (t8.status === 413 && t8.fromShuttle === true));
       return {
         status: through8 ? "pass" : proxy413 ? "fail" : "info",
-        summary: `${through8 ? (largestPass >= 8 * MiB ? "8 MiB PUT 2xx" : "8 MiB body reached the stub (its own 413; run the stub with SHUTTLE_MAX_BLOB=8650752 for a 2xx)") : "8 MiB did not reach the stub"}; largest passing PUT ${largestPass} B; ${proxy413 ? "a PROXY returned 413" : "no proxy 413"}`,
+        summary: `${through8 ? (largestPass >= 8 * MiB ? "8 MiB PUT 2xx" : "8 MiB body reached the server (its own 413; run it with SHUTTLE_MAX_BLOB=8650752 for a 2xx)") : "8 MiB did not reach the server"}; largest passing PUT ${largestPass} B; ${proxy413 ? "a PROXY returned 413" : "no proxy 413"}`,
         data: { tries, largestPass, proxy413, through8 },
       };
     },
@@ -276,17 +360,18 @@ export const serverProbes: Probe[] = [
     safe: true,
     needsServer: true,
     async run(ctx): Promise<ProbeOutcome> {
-      const h = await health(ctx);
-      if (!h.ok) return skipped(ctx, h);
-      const put = await putBlob(ctx, fakeBlob(64 * KiB));
+      const rd = await ready(ctx);
+      if (!("s" in rd)) return rd;
+      const { s } = rd;
+      const put = await putBlob(s, fakeBlob(64 * KiB));
       try {
-        const r = await requestUrl({ url: put.url, method: "GET", headers: { "If-None-Match": `"${put.blobId}"` }, throw: false });
+        const r = await requestUrl({ url: put.url, method: "GET", headers: { ...authHeaders(s), "If-None-Match": `"${put.blobId}"` }, throw: false });
         const etag = lowerHeaders(r.headers)["etag"] ?? null;
         return {
           status: r.status === 304 ? "pass" : "info",
           summary: r.status === 304
             ? "304 returned through requestUrl"
-            : `got ${r.status} (stub never answers 304; the fallback is a plain 200), etag header ${etag ? "visible" : "NOT visible"}`,
+            : `got ${r.status} (the server does not answer 304; the fallback is a plain 200), etag header ${etag ? "visible" : "NOT visible"}`,
           data: { status: r.status, etag },
         };
       } catch (e) {
@@ -300,8 +385,8 @@ export const serverProbes: Probe[] = [
     safe: true,
     needsServer: true,
     async run(ctx): Promise<ProbeOutcome> {
-      const h = await health(ctx);
-      if (!h.ok) return skipped(ctx, h);
+      const rd = await ready(ctx);
+      if (!("s" in rd)) return rd;
       try {
         const s = await openWs(ctx);
         const rtt = await pingRtt(s.ws, 2);
@@ -325,8 +410,8 @@ export const serverProbes: Probe[] = [
     needsServer: true,
     confirm: "Holds a WebSocket open for the configured minutes. Keep Obsidian in the foreground and the screen on.",
     async run(ctx): Promise<ProbeOutcome> {
-      const h = await health(ctx, true);
-      if (!h.ok) return skipped(ctx, h);
+      const rd = await ready(ctx, true);
+      if (!("s" in rd)) return rd;
       const minutes = Math.max(1, ctx.settings.m7IdleMinutes);
       const s = await openWs(ctx);
       const start = Date.now();
@@ -372,10 +457,10 @@ export class M8Recorder {
   armed = false;
 
   async arm(ctx: Ctx, done: (o: ProbeOutcome) => void): Promise<string> {
-    const h = await health(ctx, true);
-    if (!h.ok) {
-      done(skipped(ctx, h));
-      return "server unreachable";
+    const rd = await ready(ctx, true);
+    if (!("s" in rd)) {
+      done(rd);
+      return rd.summary;
     }
     this.disarm();
     this.session = await openWs(ctx);
@@ -403,7 +488,7 @@ export class M8Recorder {
             const realAbsence = awayMs > 5000 && !stillOpen;
             done({
               status: !realAbsence ? "info" : ms < 3000 ? "pass" : "fail",
-              summary: `${realAbsence ? "" : "RETRY (stay away more than 5 s): "}visibilitychange fired; away ${Math.round(awayMs / 1000)} s, old socket ${stillOpen ? "still open" : "closed"}, reconnect+welcome ${ms} ms (catch-up of 100 records UNVERIFIED: stub has no records)`,
+              summary: `${realAbsence ? "" : "RETRY (stay away more than 5 s): "}visibilitychange fired; away ${Math.round(awayMs / 1000)} s, old socket ${stillOpen ? "still open" : "closed"}, reconnect+welcome ${ms} ms (catch-up of 100 records UNVERIFIED: the spike vault has no records)`,
               data: { events, awayMs, stillOpen, closeInfo, reconnectMs: ms },
             });
           })

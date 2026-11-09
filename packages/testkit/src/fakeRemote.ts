@@ -325,7 +325,14 @@ export class FakeRemoteServer {
     return { etag };
   }
 
-  /** @internal */ rebuild(info: VaultInfo): { epoch: number } {
+  /**
+   * @internal design §2.11 "rebuild remote from this device". Step 3: new info and epoch atomically,
+   * versions/heads/blobs and the commit replay cache dropped, head_seq kept (seqs are never reused),
+   * minSeq = headSeq. Step 5: OTHER devices get snapshotRequired{epoch}. The rebuilding device's own
+   * feed is not parked: its cursor stays valid because head_seq is kept, and it uploads every file
+   * as a create itself (step 4). `byDevice` is that device (absent: every feed is parked).
+   */
+  rebuild(info: VaultInfo, byDevice?: DeviceId): { epoch: number } {
     if (!this.info) throw remoteError("VAULT_NOT_FOUND", "no vault-info");
     if (info.vaultId !== this.info.vaultId) throw remoteError("PROTOCOL", "vaultId cannot change");
     if (info.epoch !== this.epoch + 1) throw remoteError("PROTOCOL", `rebuild needs epoch ${this.epoch + 1}`);
@@ -338,8 +345,10 @@ export class FakeRemoteServer {
     this.heads.clear();
     this.livePath.clear();
     this.blobs.clear();
+    this.commitCache.clear();
+    for (const d of this.devices.values()) d.ackedSeq = null;
     this.minSeq = this.headSeq;
-    for (const s of [...this.subs]) s.requireSnapshot("epoch");
+    for (const s of [...this.subs]) if (s.device !== byDevice) s.requireSnapshot("epoch");
     return { epoch: this.epoch };
   }
 
@@ -995,7 +1004,7 @@ export class FakeRemote implements RemoteAdapter {
   }
   rebuild(info: VaultInfo): Promise<{ epoch: number }> {
     return this.call("rebuild", [info], () => {
-      const r = this.server.rebuild(info);
+      const r = this.server.rebuild(info, this.deviceId);
       this.epochSeen = r.epoch;
       return r;
     });

@@ -28,6 +28,12 @@
     },
     {
       "path": "../testkit"
+    },
+    {
+      "path": "../headless"
+    },
+    {
+      "path": "../server"
     }
   ]
 }

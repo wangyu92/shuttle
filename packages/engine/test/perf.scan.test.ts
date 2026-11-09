@@ -16,20 +16,20 @@ describe("I23 fast path", () => {
     const files: Record<string, string> = {};
     for (let i = 0; i < N; i++) files[`d${i % 50}/f${i}.md`] = `n${i}`;
     a.fs.seed(files, { mtime });
-    // Index rows of a device that synced these files before. Written straight into the fake's storage:
-    // MemStateStore checks unique indexes by scanning, which is quadratic at 10k puts (testkit note).
-    const rows = a.store.data.stores.get("files")!;
+    // Index rows of a device that synced these files before (one transaction; the MemStateStore
+    // index maps keep the unique-path checks linear).
+    const entries: FileEntry[] = [];
     let i = 0;
     for (const [path, body] of Object.entries(files)) {
       const fileId = (i++).toString(16).padStart(32, "0");
       const h = "h".repeat(64);
-      const e: FileEntry = {
+      entries.push({
         fileId, path, foldKey: foldKey(path), scope: "active", kind: "note",
         obs: { mtime, size: body.length, hash: h }, synced: { version: i, path, hash: h, size: body.length, mtime, hasBase: false },
         updatedAt: mtime,
-      };
-      rows.set(`s:${fileId}`, { key: fileId, value: e as unknown as Record<string, unknown> });
+      });
     }
+    await a.store.tx(["files"], async (tx) => { for (const e of entries) await tx.files.put(e); });
     let hashes = 0;
     const slices: number[] = [];
     let last = 0;

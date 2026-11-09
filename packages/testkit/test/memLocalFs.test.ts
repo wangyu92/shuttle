@@ -210,3 +210,32 @@ describe("MemLocalFs faults", () => {
     expect(fs.readText("a.md")).toBe("abc");
   });
 });
+
+describe("MemLocalFs torn writes", () => {
+  it("tearNextWrite leaves a prefix without an event and throws; later writes are whole", async () => {
+    const fs = new MemLocalFs();
+    fs.seed({ "a.md": "old content" });
+    const events: unknown[] = [];
+    fs.onEvent((e) => events.push(e));
+    let killed = "";
+    fs.tearNextWrite({ path: "a.md", keep: 4, onTear: (p) => { killed = p; } });
+    expect(fs.pendingTears).toBe(1);
+    await expect(fs.write("a.md", new TextEncoder().encode("new content"), { mtime: 5 })).rejects.toMatchObject({ code: "EIO" });
+    expect(killed).toBe("a.md");
+    expect(fs.readText("a.md")).toBe("new ");
+    expect(fs.torn).toEqual([{ path: "a.md", kept: 4, of: 11 }]);
+    await Promise.resolve();
+    expect(events).toEqual([]);
+    await fs.write("a.md", new TextEncoder().encode("whole"), { mtime: 6 });
+    expect(fs.readText("a.md")).toBe("whole");
+    expect(fs.pendingTears).toBe(0);
+  });
+
+  it("skip, fraction and an onTear that throws (process death) are honored", async () => {
+    const fs = new MemLocalFs();
+    fs.tearNextWrite({ fraction: 0.5, skip: 1, onTear: () => { throw new Error("killed"); } });
+    await fs.write("x.bin", new Uint8Array(10), { mtime: 1 });
+    await expect(fs.write("y.bin", new Uint8Array(10).fill(7), { mtime: 1 })).rejects.toThrow("killed");
+    expect(fs.files().get("y.bin")).toEqual(new Uint8Array(5).fill(7));
+  });
+});

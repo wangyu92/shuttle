@@ -126,6 +126,7 @@ export class Maintenance {
           }
         }
       });
+      srv.store.stored.drop(vid); // inline bodies went with the versions
       await yieldTick();
     }
   }
@@ -158,6 +159,7 @@ export class Maintenance {
         }
         if (maxSeq > 0) srv.s.run("UPDATE vaults SET min_seq = MAX(min_seq, ?) WHERE vault_id = ?", maxSeq, vid);
       });
+      srv.store.stored.drop(vid);
       await yieldTick();
     }
   }
@@ -196,6 +198,7 @@ export class Maintenance {
       `DELETE FROM blobs WHERE vault_id = ? AND state = 'doomed'
        AND NOT EXISTS (SELECT 1 FROM version_blobs vb WHERE vb.vault_id = blobs.vault_id AND vb.blob_id = blobs.blob_id)
        RETURNING blob_id`, vid).map((r) => r.blob_id));
+    srv.store.stored.drop(vid);
     const moved: string[] = [];
     for (const id of ids) {
       const dest = path.join(srv.blobs.graveyard, `${id}.${runId}`);
@@ -259,6 +262,7 @@ export class Maintenance {
         }
         srv.s.run("DELETE FROM meta WHERE k IN (?, ?)", `gc_phase_a:${vault_id}`, `orphan_scan:${vault_id}`);
       });
+      srv.store.stored.drop(vault_id);
       await rm(srv.blobs.vaultDir(vault_id), { recursive: true, force: true });
       stats.vaultsPurged++;
     }

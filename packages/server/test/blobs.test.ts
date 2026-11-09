@@ -33,6 +33,10 @@ describe("health", () => {
     const body = await res.json();
     expect(body).toMatchObject({ ok: true, protocols: [1], source: "https://example.invalid/shuttle" });
     expect(typeof body.time).toBe("number");
+    // Limits are published before subscribe, on health and on /v1/me, equal to welcome.limits.
+    expect(body.limits).toEqual(srv.core.cfg.limits);
+    expect(body.limits.maxInFlightCommits).toBe(DEFAULT_LIMITS.maxInFlightCommits);
+    expect((await api(srv, c, "GET", "/v1/me")).json.limits).toEqual(srv.core.cfg.limits);
   });
 });
 

@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "vaultPath": "/data/vault",
+  "tmpPath": "/data/.shuttle-tmp",
+  "mode": "push-only",
+  "remote": { "type": "shuttle-server", "urls": ["https://sync.example.com"], "vaultId": "<vault id>" },
+  "device": { "name": "mirror" },
+  "conflictMode": "conflictFile",
+  "deleteMode": "delete",
+  "configCategories": {},
+  "selective": { "images": true, "audio": true, "videos": true, "pdfs": true, "other": true },
+  "excludedFolders": [],
+  "maxFileBytes": 209715200,
+  "watch": { "mode": "hybrid", "pollIntervalSec": 30 },
+  "guards": { "onTrip": "pause" },
+  "watchdog": { "stallSec": 600 },
+  "maintenance": "auto",
+  "autoRepair": false
+}

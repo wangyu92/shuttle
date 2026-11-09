@@ -1,0 +1,5 @@
+# Build context for packages/server/Dockerfile and packages/headless/Dockerfile:
+# the images copy only the esbuild bundles from dist/.
+*
+!dist/server/
+!dist/headless/

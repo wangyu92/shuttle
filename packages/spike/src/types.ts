@@ -18,6 +18,8 @@ export interface ProbeResult extends ProbeOutcome {
 
 export interface SpikeSettings {
   serverUrl: string;
+  /** Device token (sxd_…) or a one-time enroll code (SXE-…) for the real server; the code is swapped for a token. */
+  serverToken: string;
   deviceName: string;
   m7IdleMinutes: number;
   postResults: boolean;
@@ -34,6 +36,8 @@ export interface Ctx {
   confirm(title: string, body: string): Promise<boolean>;
   ask(question: string, options: string[]): Promise<string | null>;
   ensureFolder(path: string): Promise<void>;
+  /** Persists ctx.settings (the server probes store the device token an enroll code was swapped for). */
+  saveSettings(): Promise<void>;
   /** Plugin-held state shared with lifecycle recorders registered at onload. */
   state: RecorderState;
 }

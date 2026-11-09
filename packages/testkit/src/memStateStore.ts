@@ -15,10 +15,19 @@ import type {
 
 type Row = { key: StateKey; value: Record<string, unknown> };
 
-/** Committed contents, shared by every handle opened on it. */
+/**
+ * Committed contents, shared by every handle opened on it. Write rows only through tx(): the index
+ * maps below are maintained on commit, so a row put straight into `stores` is invisible to index
+ * queries (getByIndex, getAll({index, only}), unique checks).
+ */
 export class MemStateData {
   readonly stores = new Map<StoreName, Map<string, Row>>();
   readonly autoInc = new Map<StoreName, number>();
+  /**
+   * Committed secondary indexes: store → index name → index value → row keys. Equality lookups
+   * (`only`, getByIndex, unique checks) use them, so large stores are not scanned per call.
+   */
+  readonly indexes = new Map<StoreName, Map<string, Map<string, Set<string>>>>();
   schemaVersion: number;
   /** Bumped by crash()/destroy(); transactions and handles from an older generation are dead. */
   generation = 0;
@@ -33,9 +42,50 @@ export class MemStateData {
 
   reset(): void {
     this.stores.clear();
-    for (const name of Object.keys(STATE_SCHEMA) as StoreName[]) this.stores.set(name, new Map());
+    this.indexes.clear();
+    for (const name of Object.keys(STATE_SCHEMA) as StoreName[]) {
+      this.stores.set(name, new Map());
+      const ix = new Map<string, Map<string, Set<string>>>();
+      for (const n of Object.keys(STATE_SCHEMA[name].indexes)) ix.set(n, new Map());
+      this.indexes.set(name, ix);
+    }
     this.autoInc.clear();
   }
+
+  /** Keep the committed indexes in step with one row change (prev → next, either may be absent). */
+  reindex(name: StoreName, k: string, prev: Row | undefined, next: Row | undefined): void {
+    const spec = STATE_SCHEMA[name];
+    const ixs = this.indexes.get(name);
+    if (!ixs) return;
+    for (const [ixName, ix] of Object.entries(spec.indexes)) {
+      const m = ixs.get(ixName) as Map<string, Set<string>>;
+      const pv = prev?.value[ix.keyPath];
+      const nv = next?.value[ix.keyPath];
+      if (prev && isIndexValue(pv)) {
+        const set = m.get(ixKey(pv));
+        if (set) {
+          set.delete(k);
+          if (set.size === 0) m.delete(ixKey(pv));
+        }
+      }
+      if (next && isIndexValue(nv)) {
+        const key = ixKey(nv);
+        let set = m.get(key);
+        if (!set) { set = new Set(); m.set(key, set); }
+        set.add(k);
+      }
+    }
+  }
+
+  clearStore(name: StoreName): void {
+    this.stores.get(name)?.clear();
+    for (const m of this.indexes.get(name)?.values() ?? []) m.clear();
+  }
+}
+
+/** Index map key: the value with its type (IndexedDB keeps 1 and "1" apart). */
+function ixKey(v: IndexValue): string {
+  return typeof v === "boolean" ? `b:${v ? 1 : 0}` : typeof v === "number" ? `n:${v}` : `s:${v}`;
 }
 
 export interface CommitInfo { stores: readonly StoreName[]; writes: number; n: number }
@@ -85,6 +135,8 @@ function inRange(v: IndexValue, q: StateQuery): boolean {
 
 class TxState {
   readonly overlay = new Map<StoreName, Map<string, Row | null>>();
+  /** Index maps over the overlay's live rows (store → index → value → row keys). */
+  readonly ovIndex = new Map<StoreName, Map<string, Map<string, Set<string>>>>();
   readonly cleared = new Set<StoreName>();
   writes = 0;
   failure: unknown = null;
@@ -200,12 +252,14 @@ export class MemStateStore implements StateStore {
     }
     if (this.opts.beforeCommit) this.opts.beforeCommit(info);
     if (this.generation !== this.data.generation) throw new StateStoreError("CRASHED", "crashed before commit");
-    for (const name of st.cleared) this.data.stores.get(name)?.clear();
+    for (const name of st.cleared) this.data.clearStore(name);
     for (const [name, ov] of st.overlay) {
       const base = this.data.stores.get(name) as Map<string, Row>;
       for (const [k, row] of ov) {
+        const prev = base.get(k);
         if (row === null) base.delete(k);
         else base.set(k, row);
+        this.data.reindex(name, k, prev, row ?? undefined);
       }
     }
   }
@@ -257,10 +311,37 @@ export class MemStateStore implements StateStore {
     return this.data.stores.get(name)?.get(k);
   }
 
+  /** Rows whose index `ixName` equals `only`: committed index lookup merged with the overlay. */
+  private rowsWhere(st: TxState, name: StoreName, ixName: string, keyPath: string, only: IndexValue): Row[] {
+    const out = new Map<string, Row>();
+    const ov = st.overlay.get(name);
+    if (!st.cleared.has(name)) {
+      const base = this.data.stores.get(name) as Map<string, Row>;
+      const hits = this.data.indexes.get(name)?.get(ixName)?.get(ixKey(only));
+      for (const k of hits ?? []) {
+        if (ov?.has(k)) continue;
+        const row = base.get(k);
+        if (row) out.set(k, row);
+      }
+    }
+    for (const k of st.ovIndex.get(name)?.get(ixName)?.get(ixKey(only)) ?? []) {
+      const row = ov?.get(k);
+      if (!row) continue;
+      const v = row.value[keyPath];
+      if (isIndexValue(v) && compareKeys(v, only) === 0) out.set(k, row);
+    }
+    return [...out.values()];
+  }
+
   private query(st: TxState, name: StoreName, q: StateQuery = {}): Row[] {
     const spec = STATE_SCHEMA[name];
     let entries: Array<{ v: IndexValue; row: Row }>;
-    if (q.index !== undefined) {
+    if (q.index !== undefined && q.only !== undefined && q.lower === undefined && q.upper === undefined) {
+      const ix = spec.indexes[q.index];
+      if (!ix) throw new StateStoreError("NOT_IN_SCOPE", `store "${name}" has no index "${q.index}"`);
+      const only = q.only;
+      entries = this.rowsWhere(st, name, q.index, ix.keyPath, only).map((row) => ({ v: only, row }));
+    } else if (q.index !== undefined) {
       const ix = spec.indexes[q.index];
       if (!ix) throw new StateStoreError("NOT_IN_SCOPE", `store "${name}" has no index "${q.index}"`);
       entries = [];
@@ -268,6 +349,9 @@ export class MemStateStore implements StateStore {
         const v = row.value[ix.keyPath];
         if (isIndexValue(v)) entries.push({ v, row });
       }
+    } else if (q.only !== undefined && q.lower === undefined && q.upper === undefined) {
+      const r = this.getRow(st, name, q.only as StateKey);
+      entries = r && isStateKey(q.only) ? [{ v: r.key, row: r }] : [];
     } else {
       entries = this.rows(st, name).map((row) => ({ v: row.key, row }));
     }
@@ -294,6 +378,25 @@ export class MemStateStore implements StateStore {
       let ov = st.overlay.get(name);
       if (!ov) { ov = new Map(); st.overlay.set(name, ov); }
       return ov;
+    };
+    const setOverlay = (k: string, row: Row | null): void => {
+      const ov = overlay();
+      const prev = ov.get(k);
+      ov.set(k, row);
+      let ixs = st.ovIndex.get(name);
+      if (!ixs) { ixs = new Map(); st.ovIndex.set(name, ixs); }
+      for (const [ixName, ix] of Object.entries(spec.indexes)) {
+        let m = ixs.get(ixName);
+        if (!m) { m = new Map(); ixs.set(ixName, m); }
+        const pv = prev?.value[ix.keyPath];
+        if (prev && isIndexValue(pv)) m.get(ixKey(pv))?.delete(k);
+        const nv = row?.value[ix.keyPath];
+        if (row && isIndexValue(nv)) {
+          let set = m.get(ixKey(nv));
+          if (!set) { set = new Set(); m.set(ixKey(nv), set); }
+          set.add(k);
+        }
+      }
     };
     const api = {
       get: async (key: StateKey) => {
@@ -343,19 +446,20 @@ export class MemStateStore implements StateStore {
               `unique index "${name}.${ixName}" violated by key ${String(key)} (held by ${String(clash.key)})`));
           }
         }
-        overlay().set(keyStr(key), { key, value });
+        setOverlay(keyStr(key), { key, value });
         st.writes++;
         return key;
       },
       delete: async (key: StateKey) => {
         guard(true);
-        overlay().set(keyStr(key), null);
+        setOverlay(keyStr(key), null);
         st.writes++;
       },
       clear: async () => {
         guard(true);
         st.cleared.add(name);
         st.overlay.delete(name);
+        st.ovIndex.delete(name);
         st.writes++;
       },
     };

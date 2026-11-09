@@ -18,6 +18,9 @@ const BUFFERED_HIGH = 4 * 1024 * 1024; // design §2.9.4: stop sending above 4 M
 
 type ConnState = "new" | "parked" | "catchup" | "live" | "closed";
 
+/** retryAfterMs for a commit refused because the socket already has maxInFlightCommits unanswered. */
+const IN_FLIGHT_RETRY_MS = 100;
+
 export class Conn {
   state: ConnState = "new";
   deviceId: string | null = null;
@@ -29,6 +32,8 @@ export class Conn {
   private lastTo = 0;
   private window = 8 * 1024 * 1024;
   private unacked = 0;
+  /** Commits queued for the group commit whose result has not been sent yet (design §2.9.4). */
+  private commitsInFlight = 0;
   private sent: Array<{ to: number; bytes: number }> = [];
   liveBuf: VersionRecord[] = [];
   private pumpScheduled = false;
@@ -199,6 +204,11 @@ export class Conn {
   private onCommit(msg: CommitMsg, frameBytes: number): void {
     const srv = this.srv;
     if (this.state === "parked") return this.error(msg.rid, "SNAPSHOT_REQUIRED", `snapshot required (${this.parkedReason})`);
+    // design §2.9.4: at most maxInFlightCommits unanswered commits per socket. Refused, not queued and not
+    // fatal: RATE_LIMITED is retryable, so the client resends the same cid once a result came back.
+    if (this.commitsInFlight >= srv.cfg.limits.maxInFlightCommits) {
+      return this.error(msg.rid, "RATE_LIMITED", `more than ${srv.cfg.limits.maxInFlightCommits} commits in flight`, IN_FLIGHT_RETRY_MS);
+    }
     const wait = srv.commitBuckets.take(this.deviceId!);
     if (wait > 0) return this.error(msg.rid, "RATE_LIMITED", "too many commits", wait);
     const lim = checkCommitLimits(msg, frameBytes, srv.cfg.limits);
@@ -206,7 +216,9 @@ export class Conn {
     if (!srv.store.vault(this.vaultId!)) return this.fatal(msg.rid, "VAULT_NOT_FOUND", "vault not found", CloseCode.VAULT_NOT_FOUND);
     if (srv.deviceRevoked(this.deviceId!)) return this.fatal(msg.rid, "REVOKED", "this device was removed", CloseCode.FORBIDDEN);
     const req = { cid: msg.cid, ops: msg.ops, ...(msg.atomic !== undefined ? { atomic: msg.atomic } : {}) };
+    this.commitsInFlight++;
     srv.enqueueCommit(this.vaultId!, this.deviceId!, req, this.epoch, (out) => {
+      this.commitsInFlight--;
       if (this.state === "closed") return;
       if (out instanceof CommitProtocolError) return this.fatal(msg.rid, "PROTOCOL", out.message, CloseCode.PROTOCOL);
       if (out instanceof HttpError) {

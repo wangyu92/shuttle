@@ -68,6 +68,11 @@ export interface ReconcilerDeps {
   markDirty(key: DirtyKey, reason: DirtyReason): void;
   /** Locked (design §3.13): no hashing; dirty keys accumulate. */
   isLocked(): boolean;
+  /**
+   * Where a key that needs hashing goes while Locked. Default: back into the dirty set. The engine
+   * parks it until unlock instead, so a Locked loop never re-plans the same keys (no spin).
+   */
+  onLocked?(key: DirtyKey): void;
   hooks?: ReconcileHooks;
   newFileId?: () => string;
 }
@@ -109,7 +114,8 @@ export class Reconciler {
           L = { path, hash: e.obs.hash, size: e.obs.size, mtime: e.obs.mtime, ...extra(st) };
         } else {
           if (d.isLocked()) {
-            d.markDirty(key, "retry");
+            if (d.onLocked) d.onLocked(key);
+            else d.markDirty(key, "retry");
             return { t: "locked" };
           }
           if (d.hooks?.isTorn && (await d.hooks.isTorn(path, st))) {

@@ -136,11 +136,16 @@ export class Budget {
   readonly bytes: ByteBudget;
   readonly hashBytes: ByteBudget;
   readonly hashSlots: Semaphore;
+  /** Concurrent blob uploads / downloads, engine-wide (design §3.15). */
+  readonly uploadSlots: Semaphore;
+  readonly downloadSlots: Semaphore;
 
   constructor(readonly limits: PlatformBudgets, maxFileBytes: () => number) {
     this.bytes = new ByteBudget(limits.inFlightBytes, maxFileBytes);
     this.hashBytes = new ByteBudget(limits.hashBytes, maxFileBytes);
     this.hashSlots = new Semaphore(limits.hashConcurrency);
+    this.uploadSlots = new Semaphore(Math.max(1, limits.uploadConcurrency));
+    this.downloadSlots = new Semaphore(Math.max(1, limits.downloadConcurrency));
   }
 
   async acquireHash(n: number): Promise<void> {

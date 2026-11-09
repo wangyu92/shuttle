@@ -696,6 +696,14 @@ export const validateChangesResponse = run<T.ChangesResponse>((v, p) => changeBa
 export const validateChangeBatch = run<T.ChangeBatch>((v, p) => changeBatchBody(obj(v, p), p, true));
 export const validateCommitResponse = run<T.CommitResponse>(commitResponse);
 export const validateVersionsResponse = run<T.VersionsResponse>(versionsPage);
+export const validateSnapshotRequiredDetails = run<T.SnapshotRequiredDetails>((v, p) => {
+  const o = obj(v, p);
+  seq(o.minSeq, `${p}.minSeq`);
+  pos(o.epoch, `${p}.epoch`);
+  lit(o.reason, `${p}.reason`, SNAPSHOT_REASONS);
+  if (optional(o, "rollbackAt") && o.rollbackAt !== null) nonNeg(o.rollbackAt, `${p}.rollbackAt`);
+});
+export const validatePreconditionFailedDetails = run<T.PreconditionFailedDetails>((v, p) => { str(obj(v, p).etag, `${p}.etag`, 1); });
 
 // S3 objects and adapter config
 export const validateS3Head = run<T.S3Head>(s3Head);

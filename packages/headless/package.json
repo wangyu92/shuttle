@@ -10,9 +10,15 @@
     "shuttle-headless": "../../dist/headless/shuttle-headless.mjs"
   },
   "dependencies": {
+    "@shuttle/adapter-s3": "0.0.0",
+    "@shuttle/adapter-server": "0.0.0",
+    "@shuttle/crypto": "0.0.0",
+    "@shuttle/engine": "0.0.0",
+    "@shuttle/protocol": "0.0.0",
     "ws": "8.22.1"
   },
   "devDependencies": {
+    "@shuttle/testkit": "0.0.0",
     "@types/ws": "8.18.2"
   }
 }

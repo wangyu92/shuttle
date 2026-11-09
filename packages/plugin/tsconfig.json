@@ -7,6 +7,27 @@
   },
   "include": [
     "src",
+    "test",
     "*.ts"
+  ],
+  "references": [
+    {
+      "path": "../adapter-s3"
+    },
+    {
+      "path": "../adapter-server"
+    },
+    {
+      "path": "../crypto"
+    },
+    {
+      "path": "../engine"
+    },
+    {
+      "path": "../protocol"
+    },
+    {
+      "path": "../testkit"
+    }
   ]
 }

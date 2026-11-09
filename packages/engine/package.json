@@ -7,9 +7,12 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "dependencies": {
+    "@shuttle/crypto": "0.0.0",
+    "@shuttle/protocol": "0.0.0",
     "diff-match-patch": "1.0.5"
   },
   "devDependencies": {
+    "@shuttle/testkit": "0.0.0",
     "@types/diff-match-patch": "1.0.36"
   }
 }

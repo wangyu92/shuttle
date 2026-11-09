@@ -31,7 +31,7 @@
     "test:prop": "vitest run packages/crypto/test/envelope.prop.test.ts",
     "test:int": "vitest run packages/server packages/testkit",
     "test:e2e": "node -e \"console.log('test:e2e: no end-to-end suite until P1 (design §7)')\"",
-    "lint": "tsc -b --noEmit && node scripts/check-source-rules.mjs && node scripts/check-leaks.mjs",
+    "lint": "tsc -b && node scripts/check-source-rules.mjs && node scripts/check-leaks.mjs",
     "check-no-native": "node scripts/check-no-native.mjs",
     "sim": "node -e \"console.log('sim: @shuttle/sim has no runner until P1 (design §7)')\"",
     "bench": "node -e \"console.log('bench: no benchmarks until P1; device numbers come from the spike (design §10.2)')\"",

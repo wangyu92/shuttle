@@ -10,6 +10,21 @@
   },
   "include": [
     "src",
+    "test",
     "*.ts"
+  ],
+  "references": [
+    {
+      "path": "../crypto"
+    },
+    {
+      "path": "../engine"
+    },
+    {
+      "path": "../protocol"
+    },
+    {
+      "path": "../testkit"
+    }
   ]
 }

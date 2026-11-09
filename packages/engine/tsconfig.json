@@ -7,6 +7,24 @@
   },
   "include": [
     "src",
+    "test",
     "*.ts"
+  ],
+  "references": [
+    {
+      "path": "../crypto"
+    },
+    {
+      "path": "../protocol"
+    },
+    {
+      "path": "../testkit"
+    },
+    {
+      "path": "../adapter-server"
+    },
+    {
+      "path": "../server"
+    }
   ]
 }

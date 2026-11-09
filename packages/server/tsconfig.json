@@ -12,5 +12,13 @@
     "src",
     "test",
     "*.ts"
+  ],
+  "references": [
+    {
+      "path": "../protocol"
+    },
+    {
+      "path": "../testkit"
+    }
   ]
 }

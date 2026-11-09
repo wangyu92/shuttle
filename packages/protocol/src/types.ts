@@ -302,6 +302,10 @@ export interface SnapshotResponse { headSeq: Seq; minSeq: Seq; epoch: number; re
 export interface ChangesResponse { from: Seq; to: Seq; headSeq: Seq; minSeq: Seq; records: VersionRecord[]; more: boolean; live?: boolean }
 export interface AckRequest { upTo: Seq }
 export interface VersionsResponse { records: VersionRecord[]; next: Seq | null }
+/** `details` of a 409 SNAPSHOT_REQUIRED from GET /changes (§2.8.5). */
+export interface SnapshotRequiredDetails { minSeq: Seq; epoch: number; reason: SnapshotReason; rollbackAt?: number | null }
+/** `details` of a 412 PRECONDITION_FAILED from PUT /info (§2.8.5). */
+export interface PreconditionFailedDetails { etag: string }
 
 // ---------- S3 objects (§2.10.1, §2.10.4–2.10.6) ----------
 export interface S3Head {

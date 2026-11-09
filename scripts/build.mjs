@@ -1,6 +1,6 @@
 // esbuild targets per docs/private/design/v1-design.md §8.3.
 // Usage: node scripts/build.mjs [plugin|headless|server|spike ...] [--dev]
-// Type checking is separate (`npm run lint` = tsc -b --noEmit).
+// Type checking is separate (`npm run lint` = tsc -b, declarations only into .tsbuild/).
 import { build } from "esbuild";
 import { copyFile, mkdir, rm } from "node:fs/promises";
 import path from "node:path";

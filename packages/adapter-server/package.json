@@ -5,5 +5,11 @@
   "license": "MIT",
   "type": "module",
   "main": "src/index.ts",
-  "types": "src/index.ts"
+  "types": "src/index.ts",
+  "dependencies": {
+    "@shuttle/protocol": "0.0.0"
+  },
+  "devDependencies": {
+    "@shuttle/testkit": "0.0.0"
+  }
 }

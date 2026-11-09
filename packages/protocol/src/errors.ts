@@ -113,3 +113,41 @@ export function remoteErrorFromWire(e: { code: string; message?: string; retryAf
   const spec = isWireErrorCode(e.code) ? WIRE_ERRORS[e.code] : undefined;
   return new RemoteError(code, e.message ?? e.code, spec?.retry ?? false, e.retryAfterMs ?? undefined, e.details);
 }
+
+/**
+ * Default retry flag per adapter error code (design §2.9.3 "Retry?" column; NETWORK and TIMEOUT are
+ * client-side and always retryable). Adapters use this when the remote does not say otherwise.
+ */
+export const REMOTE_ERRORS: Readonly<Record<RemoteErrorCode, { retry: boolean }>> = Object.freeze({
+  NETWORK: { retry: true },
+  TIMEOUT: { retry: true },
+  UNAUTHENTICATED: { retry: false },
+  REVOKED: { retry: false },
+  FORBIDDEN: { retry: false },
+  VAULT_NOT_FOUND: { retry: false },
+  NOT_FOUND: { retry: false },
+  PRECONDITION_FAILED: { retry: false },
+  ALREADY_EXISTS: { retry: false },
+  RATE_LIMITED: { retry: true },
+  TOO_LARGE: { retry: false },
+  QUOTA: { retry: true },
+  SNAPSHOT_REQUIRED: { retry: false },
+  HASH_MISMATCH: { retry: true },
+  PROTOCOL: { retry: false },
+  UNSUPPORTED: { retry: false },
+  SERVER: { retry: true },
+  UNAVAILABLE: { retry: true },
+});
+
+export function isRemoteErrorCode(v: unknown): v is RemoteErrorCode {
+  return typeof v === "string" && Object.prototype.hasOwnProperty.call(REMOTE_ERRORS, v);
+}
+
+/** RemoteError with the default retry flag of its code. */
+export function remoteError(code: RemoteErrorCode, message: string, o: { retryAfterMs?: number; details?: unknown } = {}): RemoteError {
+  return new RemoteError(code, message, REMOTE_ERRORS[code].retry, o.retryAfterMs, o.details);
+}
+
+export function isRemoteError(e: unknown, code?: RemoteErrorCode): e is RemoteError {
+  return e instanceof RemoteError && (code === undefined || e.code === code);
+}

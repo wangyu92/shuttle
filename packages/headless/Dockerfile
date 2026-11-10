@@ -3,7 +3,7 @@
 #   docker build -f packages/headless/Dockerfile -t shuttle-headless:0.1.0 .
 # Pin the base image by digest at build time (>= 22.13 for unflagged node:sqlite):
 #   FROM node:22-bookworm-slim@sha256:<digest>
-FROM node:22-bookworm-slim
+FROM node:22-bookworm-slim@sha256:5ec23b7c622b00547753bc6ffd78085dd868a68aeb41c8e0a1418f033e13d96d
 ENV NODE_ENV=production
 WORKDIR /app
 COPY dist/headless/ /app/

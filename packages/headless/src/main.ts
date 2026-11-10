@@ -13,7 +13,7 @@ import { SxKeyring, fromB64u, fromCache, isCryptoError, type CachedSecrets, type
 import {
   ENGINE_VERSION, createEngine, readMeta, type EventTimings, type LocalRecordStore, type SeenStore, type ShuttleEngine,
 } from "@shuttle/engine";
-import type { LocalRecord } from "@shuttle/engine";
+import type { LocalRecord, PlatformBudgets } from "@shuttle/engine";
 import { ServerAdapter, fetchHttpClient, helloSession } from "@shuttle/adapter-server";
 import { deviceSettingsOf, scanIntervalMs, watchModeOf, type HeadlessConfig } from "./config";
 import { NodeLocalFs, startupChecks } from "./NodeLocalFs";
@@ -70,6 +70,10 @@ export interface DaemonOptions {
   now?: () => number;
   /** Test hook: wraps the remote the engine sees (inside the progress tracker), e.g. to inject a stall. */
   remoteHook?: (r: RemoteAdapter) => RemoteAdapter;
+  /** Bench/test hook: NodeLocalFs `atomicReplace` (D10; default true). */
+  atomicReplace?: boolean;
+  /** Bench/test hook: engine budget overrides (e.g. `applyConcurrency`; default the node budgets). */
+  budgets?: Partial<PlatformBudgets>;
 }
 
 /**
@@ -275,6 +279,7 @@ export class Daemon {
     this.fs = new NodeLocalFs({
       root: c.vaultPath, tmpDir: c.tmpPath, readOnly, log, ...(c.configDir ? { configDir: c.configDir } : {}),
       ...(mirror ? { parkDir: path.join(this.o.stateDir, "reverted"), keepOverwritten: true } : {}),
+      ...(this.o.atomicReplace !== undefined ? { atomicReplace: this.o.atomicReplace } : {}),
     });
     this.adapter = new ServerAdapter({
       config: { urls: c.remote.urls, vaultId: c.remote.vaultId, ...(this.secrets.deviceId ? { deviceId: this.secrets.deviceId } : {}) },
@@ -322,6 +327,7 @@ export class Daemon {
       periodicScanMs: scanIntervalMs(c),
       ...(this.o.manual ? { manual: true } : {}),
       ...(this.o.timings ? { timings: this.o.timings } : {}),
+      ...(this.o.budgets ? { budgets: this.o.budgets } : {}),
     });
     // Loop heartbeat (design §6.1.7): every loop iteration goes through runOnce(); an iteration that
     // has been running for longer than stallSec is a stall, an idle loop is alive.

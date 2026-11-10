@@ -105,7 +105,9 @@ describe("Watcher", () => {
     await writeFile(path.join(vault, "fresh/deep/two.md"), "2");
     await waitFor(has((e) => e.t === "create" && e.path === "fresh/one.md"), 10_000, 20, "create one");
     await waitFor(has((e) => (e.t === "create" || e.t === "modify") && e.path === "fresh/deep/two.md"), 10_000, 20, "create two");
-  });
+    // The test timeout covers its own two 10 s waits plus the watcher start (the default 5 s cut the
+    // first wait in half, so a slow NAS walk failed as a timeout instead of the waitFor message).
+  }, 25_000);
 
   it("falls back to polling on a tiny inotify budget", async () => {
     const log = memoryLogger();

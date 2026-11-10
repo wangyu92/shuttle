@@ -3,7 +3,7 @@
 // Fixtures only: no real hosts or users.
 
 import type { DeviceSettings, EngineHooks, LocalPlatform, Scope } from "@shuttle/protocol";
-import { FakeScheduler, MemLocalFs, MemStateStore, Prng, drainMicrotasks, type FsOp } from "@shuttle/testkit";
+import { FakeScheduler, MemLocalFs, MemStateStore, Prng, drainMicrotasks, type FsOp, type MemReplaceMode } from "@shuttle/testkit";
 import type { Seen } from "@shuttle/crypto";
 import { createEngine, type EngineOptions, type LocalRecord, type ShuttleEngine } from "../src/index";
 import { CFG, Crash, TEST_PARAMS, makeWorld, serverMap, sortedEntries, type World } from "./harness";
@@ -23,6 +23,8 @@ export interface NodeOpts {
   opts?: Partial<EngineOptions>;
   /** Engine-own writes emit fs events (real platforms do). Default false for deterministic tests. */
   emitOwnEvents?: boolean;
+  /** How replaceFile reaches the disk (D8 rename, D10 atomic write, D11 swap). Default 'rename'. */
+  replace?: MemReplaceMode;
 }
 
 /** Durable per-device "localStorage" (survives restarts and DB wipes). */
@@ -53,7 +55,7 @@ export class Node {
   constructor(readonly w: World, readonly o: NodeOpts) {
     this.fs = new MemLocalFs({
       clock: w.clock, emitOwnEvents: o.emitOwnEvents ?? false, caseInsensitive: o.caseInsensitive ?? false, configDir: CFG,
-      platform: o.platform ?? "desktop", writeCreatesParents: false,
+      platform: o.platform ?? "desktop", writeCreatesParents: false, replace: o.replace ?? "rename",
     });
     this.fs.before((op, path) => { this.fsOps.push({ op, path }); });
     this.store = new MemStateStore(undefined, { beforeCommit: () => this.onCommit() });

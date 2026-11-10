@@ -8,5 +8,7 @@ export default defineConfig({
     testTimeout: 30_000,
     hookTimeout: 30_000,
     fileParallelism: false,
+    // design §7.2 H3: every test file's output is scanned for secrets in afterAll.
+    setupFiles: ["../testkit/test/h3.setup.ts"],
   },
 });

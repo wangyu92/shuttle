@@ -20,7 +20,11 @@ export function isTempName(name: string): boolean {
   return ATOMIC_TMP.test(name) || SED_TMP.test(name) || LO_LOCK.test(name);
 }
 
-/** Engine-internal names (design §3.11 step 1): swap parking files, temp downloads, replace temps (D8). */
+/**
+ * Engine-internal names (design §3.11 step 1): swap parking files, temp downloads, replace temps (D8),
+ * replace backup folders (D11).
+ */
 export function isEngineInternalName(name: string): boolean {
-  return name.startsWith(".shuttle-swap-") || name.startsWith(".shuttle-tmp-") || name.startsWith(".shuttle-replace-");
+  return name.startsWith(".shuttle-swap-") || name.startsWith(".shuttle-tmp-") || name.startsWith(".shuttle-replace-") ||
+    name.startsWith(".shuttle-bak-");
 }

@@ -1,7 +1,7 @@
 // ObsidianLocalFs over the FakeVault: Vault vs DataAdapter routing, events, NFC, errors (design §3.2).
 import { describe, expect, it } from "vitest";
-import type { LocalEvent, LocalStat } from "@shuttle/protocol";
-import { hasFsCode } from "@shuttle/engine";
+import type { LocalEvent, LocalFs, LocalStat } from "@shuttle/protocol";
+import { hasFsCode, replaceFile } from "@shuttle/engine";
 import { ObsidianLocalFs, fsCodeOf } from "../src/platform/ObsidianLocalFs";
 import { FakeVault } from "./fakeVault";
 
@@ -136,13 +136,46 @@ describe("ObsidianLocalFs", () => {
     expect(await fs.processText("absent.md", () => "x")).toBe(false);
   });
 
-  it("D8: a rename from a replace temp over an existing note writes the temp's bytes there (mobile path)", async () => {
+  it("D11: mobile refuses a replace rename over an existing note (EEXIST) and never writes the temp's bytes there", async () => {
     const { v, fs } = setup();
+    expect(fs.renameReplaces).toBe(false);
+    expect((fs as LocalFs).atomicReplace).toBeUndefined();
     await fs.write("n.md", te.encode("old"), { mtime: 1 });
     await fs.write(".shuttle-replace-1", te.encode("new!"), { mtime: 2 });
-    await fs.rename(".shuttle-replace-1", "n.md");
-    expect(v.text("n.md")).toBe("new!");
-    expect(await fs.stat(".shuttle-replace-1")).toBe(null);
+    v.calls.length = 0;
+    await expect(fs.rename(".shuttle-replace-1", "n.md")).rejects.toMatchObject({ code: "EEXIST" });
+    expect(v.text("n.md")).toBe("old");
+    expect(v.calls.filter((c) => c.includes("n.md"))).toEqual([]);
+  });
+
+  it("D11: replaceFile on mobile swaps through a backup folder, then removes it", async () => {
+    const { v, fs } = setup();
+    await fs.write("d/n.md", te.encode("old"), { mtime: 1 });
+    v.calls.length = 0;
+    await replaceFile(fs, "d/n.md", te.encode("new!"), { mtime: 2 });
+    expect(v.text("d/n.md")).toBe("new!");
+    expect(v.calls.some((c) => c === "modifyBinary:d/n.md" || c === "adapter.writeBinary:d/n.md")).toBe(false);
+    const left: string[] = [];
+    for await (const b of fs.listInternal()) for (const s of b) left.push(s.path);
+    expect(left).toEqual([]);
+  });
+
+  it("D11: listInternal finds swap leftovers Vault does not index (also under the configuration folder)", async () => {
+    const { fs } = setup();
+    await fs.write("d/n.md", te.encode("new"), { mtime: 1 });
+    await fs.mkdirp("d/.shuttle-bak-3");
+    await fs.write("d/.shuttle-bak-3/n.md", te.encode("old"), { mtime: 1 });
+    await fs.write("d/.shuttle-replace-7", te.encode("tmp"), { mtime: 1 });
+    await fs.write(".obsidian/.shuttle-replace-2", te.encode("cfg"), { mtime: 1 });
+    await fs.write(".git/.shuttle-replace-9", te.encode("not ours"), { mtime: 1 }).catch(() => undefined);
+    const found: string[] = [];
+    for await (const b of fs.listInternal()) for (const s of b) found.push(`${s.kind}:${s.path}`);
+    expect(found.sort()).toEqual([
+      "file:.obsidian/.shuttle-replace-2", "file:d/.shuttle-bak-3/n.md", "file:d/.shuttle-replace-7", "folder:d/.shuttle-bak-3",
+    ]);
+    // Vault's own listing never shows them.
+    const listed = (await listAll(fs, false)).flat().map((s) => s.path);
+    expect(listed).toEqual(["d/n.md"]);
   });
 
   it("D8: desktop renames the temp over the note through the adapter's node fs", async () => {

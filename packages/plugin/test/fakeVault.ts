@@ -182,8 +182,9 @@ export class FakeVault implements VaultLike {
         return n ? { type: n.kind, size: n.kind === "file" ? n.bytes.length : 0, mtime: n.mtime, ctime: n.ctime } : null;
       },
       list: async (p) => {
+        if (p === "/") p = "";                                 // the vault root, as DataAdapter.list("/")
         const n = this.nodes.get(p);
-        if (!n || n.kind !== "folder") throw err("ENOENT", "no such file or directory");
+        if (p !== "" && (!n || n.kind !== "folder")) throw err("ENOENT", "no such file or directory");
         const kids = [...this.nodes.keys()].filter((k) => parent(k) === p);
         return { files: kids.filter((k) => this.nodes.get(k)?.kind === "file"), folders: kids.filter((k) => this.nodes.get(k)?.kind === "folder") };
       },

@@ -10,5 +10,7 @@ export default defineConfig({
   test: {
     name: "shuttle",
     passWithNoTests: true,
+    // design §7.2 H3: every test file's output is scanned for secrets in afterAll.
+    setupFiles: ["../testkit/test/h3.setup.ts"],
   },
 });

@@ -20,21 +20,28 @@ export interface PlatformBudgets {
   maxFileBytes: number;
   pullPage: number;
   scanBatch: number;
+  /**
+   * Pull applies of distinct files in flight at once (design §3.8.2 leaves the apply order to the
+   * BatchOrderer; ingest persisted the cursor with the queue rows, §3.8.1, so apply order never moves
+   * the cursor). Deletes, moves and swap cycles still run alone. Desktop and mobile keep 1 (the Vault
+   * API and editors); node uses 4 (part 5 measurement: one fsync'd write costs ~400 ms on the NAS).
+   */
+  applyConcurrency: number;
 }
 
 /** design §3.15 table (node values follow the 512 MiB container budget, §6.1.7). */
 export const PLATFORM_BUDGETS: Readonly<Record<'desktop' | 'mobile' | 'node', Readonly<PlatformBudgets>>> = Object.freeze({
   desktop: Object.freeze({
     uploadConcurrency: 4, downloadConcurrency: 4, commitBatchOps: 50, inFlightBytes: 128 * MiB, hashConcurrency: 4, hashBytes: 64 * MiB,
-    maxChunkBytes: 4 * MiB, chunkCacheBytes: 256 * MiB, maxFileBytes: 200 * MiB, pullPage: 500, scanBatch: 500,
+    maxChunkBytes: 4 * MiB, chunkCacheBytes: 256 * MiB, maxFileBytes: 200 * MiB, pullPage: 500, scanBatch: 500, applyConcurrency: 1,
   }),
   mobile: Object.freeze({
     uploadConcurrency: 2, downloadConcurrency: 2, commitBatchOps: 20, inFlightBytes: 24 * MiB, hashConcurrency: 1, hashBytes: 16 * MiB,
-    maxChunkBytes: 4 * MiB, chunkCacheBytes: 64 * MiB, maxFileBytes: 50 * MiB, pullPage: 200, scanBatch: 250,
+    maxChunkBytes: 4 * MiB, chunkCacheBytes: 64 * MiB, maxFileBytes: 50 * MiB, pullPage: 200, scanBatch: 250, applyConcurrency: 1,
   }),
   node: Object.freeze({
     uploadConcurrency: 4, downloadConcurrency: 4, commitBatchOps: 100, inFlightBytes: 64 * MiB, hashConcurrency: 4, hashBytes: 128 * MiB,
-    maxChunkBytes: 4 * MiB, chunkCacheBytes: 0, maxFileBytes: 200 * MiB, pullPage: 1000, scanBatch: 2000,
+    maxChunkBytes: 4 * MiB, chunkCacheBytes: 0, maxFileBytes: 200 * MiB, pullPage: 1000, scanBatch: 2000, applyConcurrency: 4,
   }),
 });
 

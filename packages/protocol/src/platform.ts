@@ -32,6 +32,27 @@ export interface LocalFs {
   read(path: string): Promise<Uint8Array>;
   /** Plugin: vault.process(). `fn` returning null aborts; resolves false when aborted. */
   processText?(path: string, fn: (current: string) => string | null): Promise<boolean>;
+  /**
+   * Lead decision D10: true when write() itself replaces an existing file crash-atomically (bytes to a
+   * temp file, fsync, rename over the target), so at every instant the target holds either the old or
+   * the new bytes in full. The engine then writes merges and pull applies with one write() and no temp
+   * hop of its own. Absent or false: the engine assumes write() may tear the target in place.
+   */
+  readonly atomicReplace?: boolean;
+  /**
+   * Lead decision D11: whether rename() from an engine replace temp (`.shuttle-replace-*`) may replace
+   * an existing file at the target (D8 convention). false: the platform cannot (Obsidian mobile,
+   * DataAdapter.rename refuses an occupied target); the engine then moves the target aside to a
+   * recoverable backup (`.shuttle-bak-*` folder) and renames the temp into the freed path. Absent:
+   * unknown; the engine tries the replace rename and falls back to the backup swap on EEXIST.
+   */
+  readonly renameReplaces?: boolean;
+  /**
+   * Lead decision D11: engine-internal leftovers (any path with a segment starting with `.shuttle-`)
+   * where listAll() does not return them (Obsidian indexes no dot names). Absent: the engine filters
+   * listAll({ includeConfigDir: true }) instead.
+   */
+  listInternal?(): AsyncIterable<LocalStat[]>;
   /** MUST be crash-atomic where the platform allows (temp file + rename, design §3.2); write intents cover the rest (§3.8.4). */
   write(path: string, data: Uint8Array, opts: { mtime: number; ctime?: number }): Promise<LocalStat>;
   writeChunked?(path: string, chunks: AsyncIterable<Uint8Array>, opts: { mtime: number }): Promise<LocalStat>;

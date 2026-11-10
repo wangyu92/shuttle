@@ -23,6 +23,9 @@ import { BlobPipeline, type ContentParams } from "./content/BlobPipeline";
 import { ChunkCache } from "./content/ChunkCache";
 import { readAndHash } from "./content/hash";
 import { WriteIntents } from "./apply/WriteIntents";
+import { SwapRecovery } from "./apply/SwapRecovery";
+import { foldKey } from "./path/normalize";
+import { conflictCopyPath, conflictStamp, hostTzOffset } from "./merge/conflictName";
 import { RemoteApplier, type DrainStats } from "./apply/RemoteApplier";
 import { Ingest, type ResyncMode } from "./remote/ingest";
 import { decodeRecord } from "./remote/records";
@@ -227,6 +230,8 @@ export class ShuttleEngine implements Engine {
   reconciler!: Reconciler;
   renames!: LocalRenames;
   intents!: WriteIntents;
+  /** D11: interrupted backup swaps of replaceFile (startup and before each replace). */
+  swaps!: SwapRecovery;
   blobs!: BlobPipeline;
   events!: LocalEventQueue;
   readonly echo: EchoSuppressor;
@@ -431,6 +436,10 @@ export class ShuttleEngine implements Engine {
       this.log.add({ cat: "error", key: "log.selfTestFailed" });
     }
     await this.ingest.load();
+    // D11: backups of interrupted swaps first (a missing target is put back before any intent check
+    // or scan could read it as deleted), then the intents (design §3.8.4).
+    this.swaps.install();
+    await this.swaps.startup();
     this.torn = await this.intents.startupCheck();
     await this.runner.resume();
     markPendingLocalChanges(this.index, (k, r) => this.dirty.mark(k, r));
@@ -473,6 +482,7 @@ export class ShuttleEngine implements Engine {
     }
     this.kickTimer = this.retryTimer = this.periodicTimer = this.configTimer = this.hiddenCloseTimer = this.reconnectTimer = this.catchUpTimer = null;
     await this.whenIdle();
+    this.swaps?.uninstall();
     await this.closeRemote();
     this.started = false;
     this.publishStatus();
@@ -874,7 +884,7 @@ export class ShuttleEngine implements Engine {
         inFlightBytes: this.budgets.inFlightBytes, hashBytes: this.budgets.hashBytes, hashConcurrency: this.budgets.hashConcurrency,
         uploadConcurrency: this.budgets.uploadConcurrency, downloadConcurrency: this.budgets.downloadConcurrency,
         commitBatchOps: this.budgets.commitBatchOps, maxFileBytes: this.settings.maxFileBytes, pullPage: this.budgets.pullPage,
-        scanBatch: this.budgets.scanBatch, chunkCacheBytes: this.budgets.chunkCacheBytes,
+        scanBatch: this.budgets.scanBatch, chunkCacheBytes: this.budgets.chunkCacheBytes, applyConcurrency: this.budgets.applyConcurrency,
         bytesInFlight: this.budget.bytes.inFlight, bytesPeak: this.budget.bytes.stats.peak,
       },
     };
@@ -1028,6 +1038,20 @@ export class ShuttleEngine implements Engine {
     this.dirty.mark(k, r);
   };
 
+  /** D11: a free conflict-copy name for a swap backup the engine cannot account for (design §3.10.5). */
+  private async freeSwapCopyPath(path: string): Promise<string> {
+    const now = this.deps.clock.now();
+    const stamp = conflictStamp(now, (this.opts.tzOffset ?? hostTzOffset)(now));
+    const taken = new Set<string>();
+    for (const e of this.index.all()) taken.add(foldKey(e.path));
+    for (let i = 0; i < 100; i++) {
+      const p = conflictCopyPath(path, this.settings.deviceName, stamp, (x) => taken.has(foldKey(x)));
+      if ((await this.deps.fs.stat(p).catch(() => null)) === null) return p;
+      taken.add(foldKey(p));
+    }
+    throw new Error(`no free conflict-copy name for ${path}`);
+  }
+
   private toLog = (e: { key: string; cat: LogInput["cat"]; params?: LogInput["params"]; path?: string; fileId?: FileId }): void => {
     this.log.add({ cat: e.cat, key: e.key, ...(e.params ? { params: e.params } : {}), ...(e.path !== undefined ? { path: e.path } : {}), ...(e.fileId !== undefined ? { fileId: e.fileId } : {}) });
   };
@@ -1064,6 +1088,10 @@ export class ShuttleEngine implements Engine {
       ...(this.budgets.chunkCacheBytes > 0 ? { cache: this.chunkCache } : {}),
     });
     this.intents = new WriteIntents({ state: d.state, fs, now });
+    this.swaps = new SwapRecovery({
+      fs, index: this.index, intents: this.intents, markDirty: this.markDirty, log: this.toLog,
+      conflictPath: (p) => this.freeSwapCopyPath(p),
+    });
     this.renames = new LocalRenames({ index: this.index, scopeOf: this.scopeOf, markDirty: this.markDirty });
     // The applier's own legality check logs the Sync string; let 'illegal' through the scope gate to it.
     const applierScope = (p: string, size?: number): Scope => {
@@ -1072,7 +1100,7 @@ export class ShuttleEngine implements Engine {
     };
     this.applier = new RemoteApplier({
       fs, state: d.state, index: this.index, journal: this.journal, blobs: this.blobs, intents: this.intents,
-      locks: this.locks, echo: this.echo, now, ...(hooks ? { hooks } : {}), markDirty: this.markDirty, scopeOf: applierScope, kindOf: kind, rcOf,
+      applyConcurrency: () => this.budgets.applyConcurrency, locks: this.locks, echo: this.echo, now, ...(hooks ? { hooks } : {}), markDirty: this.markDirty, scopeOf: applierScope, kindOf: kind, rcOf,
       isLegal: (p) => !isIllegal(p, rules), needsBase: this.needsBase, maxFileBytes: () => this.settings.maxFileBytes,
       deleteMode: () => this.settings.deleteMode,
       keepFolder: (p) => p === cfg || this.settings.excludedFolders.some((f) => f === p),

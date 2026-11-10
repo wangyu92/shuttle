@@ -87,6 +87,8 @@ export interface RemoteApplierDeps {
   targetHead?(fileId: FileId, hash: string): Promise<RemoteHead | null>;
   log?(e: ApplierLog): void;
   randomBytes?: RandomBytes;
+  /** Applies of distinct files in flight at once (budget `applyConcurrency`, design §3.15). Default 1. */
+  applyConcurrency?(): number;
 }
 
 export type ApplyOutcome =
@@ -162,8 +164,47 @@ export class RemoteApplier {
     if (holdDeletes) s.held += items.length - ready.length;
     const { order, cycles } = orderApplies(ready, this.d.fs.configDir);
     for (const c of cycles) for (const out of await this.applyCycle(c)) count(s, out);
-    for (const id of order) count(s, await this.applyOne(id));
+    const width = Math.max(1, Math.floor(this.d.applyConcurrency?.() ?? 1));
+    if (width === 1) for (const id of order) count(s, await this.applyOne(id));
+    else await this.applyWindow(order, width, (out) => count(s, out));
     return s;
+  }
+
+  /**
+   * Bounded concurrent applies (budget `applyConcurrency`, part 5; 클로드 제안(미승인)). Ingest already
+   * persisted the cursor together with the heads and queue rows (design §3.8.1, invariant 9), so the
+   * order of applies never moves the cursor; what must hold is the BatchOrderer's order (§3.8.2:
+   * path-freeing effects before path-needing ones). Items are started in that order and never
+   * overtake: an item waits while it shares a lock key (fileId, foldKey of a path) with one in flight,
+   * and deletes and moves (they free paths and remove emptied parent folders, which would race a
+   * concurrent mkdir + write in that folder) run alone after everything before them finished.
+   */
+  private async applyWindow(order: readonly FileId[], width: number, done: (o: ApplyOutcome) => void): Promise<void> {
+    const flying = new Map<Promise<void>, ReadonlySet<string>>();
+    let failure: { err: unknown } | null = null;
+    const settleOne = () => Promise.race(flying.keys());
+    const drainAll = async () => { while (flying.size > 0) await settleOne(); };
+    for (const id of order) {
+      if (failure) break;
+      const R = this.d.index.remote.byFileId(id);
+      const e = this.d.index.byFileId(id);
+      const alone = !R || R.deleted || (e !== null && e.path !== R.path);
+      const keys = new Set(this.lockKeys(id, R, e));
+      if (alone) {
+        await drainAll();
+        if (failure) break;
+        done(await this.applyOne(id));
+        continue;
+      }
+      const clashes = () => [...flying.values()].some((ks) => [...keys].some((k) => ks.has(k)));
+      while (flying.size >= width || (flying.size > 0 && clashes())) await settleOne();
+      if (failure) break;
+      const p: Promise<void> = this.applyOne(id).then(done, (err: unknown) => { failure ??= { err }; })
+        .finally(() => { flying.delete(p); });
+      flying.set(p, keys);
+    }
+    await drainAll();
+    if (failure) throw (failure as { err: unknown }).err;
   }
 
   /** applyOne with locks (design §3.8.4). */

@@ -3,13 +3,17 @@
 // - Files Obsidian indexes (everything outside dot folders) go through Vault so its cache, open
 //   editors and other plugins see the change; the configuration folder and other dot paths go
 //   through the DataAdapter, because Vault does not index them.
-// - write() replaces the file in place (Vault.modifyBinary / createBinary, adapter.writeBinary). The
-//   engine makes merge writes and pull applies crash-safe itself (lead decision D8): it writes a
-//   `.shuttle-replace-*` temp in the same folder and renames it over the target. rename() from such a
-//   temp replaces an existing file: on desktop through the adapter's node fs (atomic rename(2)); on
-//   mobile DataAdapter.rename refuses to overwrite and the overwrite behaviour is unmeasured (P0 M22),
-//   so the temp's bytes are written over the target in place (residual risk: the pre-D8 torn write,
-//   still covered by write intents, design §3.8.4, and the staged merge, D1).
+// - write() replaces the file in place (Vault.modifyBinary / createBinary, adapter.writeBinary), so
+//   `atomicReplace` is not declared (lead decision D10). The engine makes merge writes and pull applies
+//   crash-safe itself: it writes a `.shuttle-replace-*` temp in the same folder, then
+//    - desktop (D8, `renameReplaces`): renames it over the target through the adapter's node fs
+//      (atomic rename(2));
+//    - mobile (D11, `renameReplaces: false`): DataAdapter.rename refuses an occupied target and the
+//      overwrite behaviour is unmeasured (P0 M22). The engine moves the target into a
+//      `.shuttle-bak-*` folder, renames the temp into the freed path and removes the backup; a rename
+//      from a temp over an existing file here throws EEXIST and never writes the temp's bytes over the
+//      target in place. listInternal() finds leftovers of an interrupted swap (Vault does not index
+//      dot names).
 // - Paths are NFC towards the engine. A file whose on-disk name is not NFC (Android, Linux) is
 //   remembered under its NFC form so reads and writes reach the real file.
 // - Events are registered when the engine asks (after `workspace.onLayoutReady`, so the load-time
@@ -134,6 +138,15 @@ export class ObsidianLocalFs implements LocalFs {
   /** NFC path → on-disk path, only for names that are not NFC on disk. */
   private readonly real = new Map<string, string>();
   private readonly refs = new Set<unknown>();
+
+  /**
+   * D8/D11: a replace rename can only go through the desktop adapter's node fs. Mobile has none, so the
+   * engine uses its backup swap there.
+   */
+  get renameReplaces(): boolean {
+    const a = this.vault.adapter;
+    return typeof a.fsPromises?.rename === "function" && typeof a.getFullPath === "function";
+  }
 
   constructor(o: ObsidianLocalFsOptions) {
     this.vault = o.vault;
@@ -295,34 +308,64 @@ export class ObsidianLocalFs implements LocalFs {
   /**
    * Lead decision D8: rename an engine replace temp over an existing file. Desktop: rename(2) through
    * the adapter's node fs (atomic; Obsidian's watcher reports the change). Mobile has no rename over an
-   * existing file (DataAdapter.rename refuses, P0 M22): the temp's bytes are written over the target in
-   * place, then the temp is removed. That is the pre-D8 exposure (a torn in-place write), the residual
-   * risk; the target is never removed first.
+   * existing file (DataAdapter.rename refuses, P0 M22): EEXIST, and the engine swaps through a backup
+   * (D11). The temp's bytes are never written over the target in place, and the target is never
+   * removed first.
    */
   private async replaceWith(tmp: string, to: string): Promise<void> {
     const a = this.vault.adapter;
-    if (a.fsPromises && a.getFullPath) {
-      try {
-        await a.fsPromises.rename(a.getFullPath(this.disk(tmp)), a.getFullPath(this.disk(to)));
-      } catch (e) {
-        throw wrap(e, tmp);
-      }
-      return;
+    if (!this.renameReplaces || !a.fsPromises || !a.getFullPath) {
+      throw new PluginFsError("EEXIST", to, `rename target exists and this platform cannot replace it: ${to}`);
     }
-    let bytes: ArrayBuffer;
-    let mtime: number;
     try {
-      bytes = await a.readBinary(this.disk(tmp));
-      mtime = (await a.stat(this.disk(tmp)))?.mtime ?? Date.now();
+      await a.fsPromises.rename(a.getFullPath(this.disk(tmp)), a.getFullPath(this.disk(to)));
     } catch (e) {
       throw wrap(e, tmp);
     }
-    await this.write(to, new Uint8Array(bytes), { mtime });
-    try {
-      await a.remove(this.disk(tmp));
-    } catch {
-      // A leftover temp is ignored by the path filter (dot name); the next write replaces nothing of it.
+  }
+
+  /**
+   * D11: engine-internal leftovers (`.shuttle-*` names) Vault does not index: walks every folder Vault
+   * knows plus the configuration folder through the adapter, at startup only (one list per folder).
+   */
+  async *listInternal(): AsyncIterable<LocalStat[]> {
+    const a = this.vault.adapter;
+    const out: LocalStat[] = [];
+    const isInternal = (p: string): boolean => p.split("/").some((seg) => seg.startsWith(".shuttle-"));
+    const stack: Array<{ dir: string; inside: boolean }> = [{ dir: "", inside: false }];
+    const seen = new Set<string>();
+    while (stack.length) {
+      const { dir, inside } = stack.pop() as { dir: string; inside: boolean };
+      if (seen.has(dir)) continue;
+      seen.add(dir);
+      let l: { files: string[]; folders: string[] };
+      try {
+        l = await a.list(dir === "" ? "/" : dir);
+      } catch {
+        if (dir !== "") continue;
+        try {
+          l = await a.list("");
+        } catch {
+          continue;
+        }
+      }
+      for (const sub of l.folders) {
+        const name = sub.slice(sub.lastIndexOf("/") + 1);
+        const internal = name.startsWith(".shuttle-");
+        // Other dot folders (.git, .trash) never hold engine writes, except the configuration folder.
+        if (name.startsWith(".") && !internal && sub !== this.configDir && !this.isConfig(sub)) continue;
+        if (inside || internal) out.push({ path: this.note(sub), kind: "folder", size: 0, mtime: 0, ctime: 0 });
+        stack.push({ dir: sub, inside: inside || internal });
+      }
+      for (const fp of l.files) {
+        if (!inside && !isInternal(fp)) continue;
+        const st = await a.stat(fp).catch(() => null);
+        if (!st || st.type !== "file") continue;
+        out.push({ path: this.note(fp), kind: "file", size: st.size, mtime: st.mtime, ctime: st.ctime });
+      }
+      if (out.length >= this.batch) yield out.splice(0, out.length);
     }
+    if (out.length) yield out;
   }
 
   async remove(path: string, mode: RemoveMode): Promise<void> {

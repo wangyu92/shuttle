@@ -1,7 +1,7 @@
 // The H3 output guard itself (design §7.2 H3): it captures the console, scans every encoding and
 // reports a hit without echoing the secret.
 import { afterEach, describe, expect, it } from "vitest";
-import { createOutputGuard, guardLog, noteSecret, type OutputGuard } from "./outputGuard";
+import { createOutputGuard, currentFileGuard, guardLog, guardOutput, noteSecret, type OutputGuard } from "./outputGuard";
 
 const SECRET = "sxd_alice-test-token-0123456789";
 const KEY = new Uint8Array(32).map((_, i) => (i * 37 + 11) & 0xff);
@@ -42,7 +42,17 @@ describe("output guard", () => {
     expect(() => g!.check()).not.toThrow();
     g.uninstall();
     expect(console.warn).toBe(before);
-    noteSecret(SECRET); // no guard installed: no-op
-    guardLog(SECRET);
+  });
+
+  it("the project setup file installed one guard for this file; suites only add secrets to it", () => {
+    const fg = currentFileGuard();
+    expect(fg).not.toBe(null);
+    expect(guardOutput({ name: "suite secret", value: "suite-secret-value-123" })).toBe(fg);
+    console.info("h3 setup marker line");
+    guardLog("h3 routed log line");
+    noteSecret("another-noted-secret-456");
+    expect(fg!.text).toContain("h3 setup marker line");
+    expect(fg!.text).toContain("h3 routed log line");
+    expect(() => fg!.check()).not.toThrow();
   });
 });

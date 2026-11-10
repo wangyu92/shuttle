@@ -1,6 +1,6 @@
-// design §7.2 H3 (no secrets in output): a suite that handles keys, tokens or passwords captures what
-// it prints and scans it in afterAll. Captured: console.log/info/warn/error/debug of the test file,
-// plus anything a test routes through guardLog (server logs, client logs). Cheap on purpose: one
+// design §7.2 H3 (no secrets in output): every test file captures what it prints and scans it in
+// afterAll (installed by the project's setup file, h3.setup.ts; suites only register their secrets).
+// Captured: console.log/info/warn/error/debug of the test file, plus anything a test routes through guardLog (server logs, client logs). Cheap on purpose: one
 // indexOf per secret encoding over a small text, once per file.
 import { afterAll } from "vitest";
 import { MIN_SECRET_LENGTH, OutputCapture, assertNoSecrets, type SecretInput } from "../src/secretScan";
@@ -66,8 +66,43 @@ export function createOutputGuard(initial: readonly SecretInput[] = []): OutputG
   return g;
 }
 
-/** Install a guard for this test file and scan its output in afterAll (design §7.2 H3). */
+/**
+ * The guard installed for the current test file by the project's setup file (h3.setup.ts, one
+ * vitest `setupFiles` entry per project), or null when the file runs without it.
+ */
+let fileGuard: OutputGuard | null = null;
+
+/**
+ * design §7.2 H3 for every test file: called once from the project's setup file. Captures the file's
+ * console and scans it in afterAll for the secrets the file registers (guardOutput, noteSecret) plus
+ * `initial`.
+ */
+export function installFileGuard(...initial: SecretInput[]): OutputGuard {
+  const g = createOutputGuard(initial);
+  fileGuard = g;
+  afterAll(() => {
+    g.uninstall();
+    if (fileGuard === g) fileGuard = null;
+    g.check();
+  });
+  return g;
+}
+
+/** The setup-installed guard of this test file (tests of the setup itself). */
+export function currentFileGuard(): OutputGuard | null {
+  return fileGuard;
+}
+
+/**
+ * Register this file's secrets and return its guard (design §7.2 H3). With the project setup file the
+ * guard already exists and its afterAll already scans; without it (a file run outside its project
+ * config) a guard is installed here with its own afterAll.
+ */
 export function guardOutput(...initial: SecretInput[]): OutputGuard {
+  if (fileGuard) {
+    fileGuard.add(...initial);
+    return fileGuard;
+  }
   const g = createOutputGuard(initial);
   afterAll(() => {
     g.uninstall();

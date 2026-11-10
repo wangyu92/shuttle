@@ -6,7 +6,9 @@
 //   byte order (an NFC one wins) is the file, the other is skipped and logged once (never synced,
 //   never deleted).
 // - write(): temp file in `tmpDir` (same mount as the vault: rename(2) across bind mounts is EXDEV) →
-//   fsync → utimes(mtime) → mkdirp → rename into place → fsync the parent directory. Crash-atomic.
+//   fsync → utimes(mtime) → mkdirp → rename into place → fsync the parent directory. Crash-atomic, so
+//   the class declares `atomicReplace` (lead decision D10) and the engine's replaceFile writes merges and
+//   pull applies with this one write() instead of a second temp + rename + directory fsync.
 // - rename(): refuses an occupied target, except from an engine replace temp (`.shuttle-replace-*`,
 //   lead decision D8): that rename replaces the file at the target atomically.
 // - stat(): lstat; ENOENT/ENOTDIR → null. Symlinks are never followed nor listed.
@@ -97,6 +99,11 @@ export interface NodeLocalFsOptions {
   parkDir?: string;
   /** Park a copy of every file a write replaces (mirror-remote: reverted local edits are kept). */
   keepOverwritten?: boolean;
+  /**
+   * Lead decision D10: declare `atomicReplace` (write() is temp + fsync + rename, so the engine skips
+   * its own temp hop). Default true; false only to measure or test the D8 path.
+   */
+  atomicReplace?: boolean;
 }
 
 type Sig = string;
@@ -120,6 +127,10 @@ function sigOf(st: LocalStat): Sig {
 
 export class NodeLocalFs implements LocalFs {
   readonly platform: LocalPlatform = "node";
+  /** D10: write() replaces the target crash-atomically (see the header). */
+  readonly atomicReplace: boolean;
+  /** D8: rename(2) from a replace temp replaces an existing file. */
+  readonly renameReplaces = true;
   readonly caseInsensitive: boolean;
   readonly configDir: string;
   readonly root: string;
@@ -144,6 +155,7 @@ export class NodeLocalFs implements LocalFs {
   constructor(o: NodeLocalFsOptions) {
     this.root = path.resolve(o.root);
     this.tmpDir = path.resolve(o.tmpDir);
+    this.atomicReplace = o.atomicReplace ?? true;
     this.configDir = o.configDir ?? ".obsidian";
     this.readOnly = o.readOnly ?? false;
     this.caseInsensitive = o.caseInsensitive ?? false;

@@ -50,7 +50,19 @@ export interface MemLocalFsOptions {
   expandFolderEvents?: boolean;
   /** write() creates missing parent folders (default false: ENOENT, like a plain fs.writeFile). */
   writeCreatesParents?: boolean;
+  /**
+   * How the engine's replaceFile reaches the disk (lead decisions D8, D10, D11):
+   *  - 'rename' (default): a rename from a replace temp replaces an existing file (desktop, D8);
+   *  - 'atomic': write() replaces atomically (`atomicReplace`, the headless NodeLocalFs, D10). A torn
+   *    write then leaves the target whole (the prefix stays in a hidden temp that is gone);
+   *  - 'swap': no rename may replace an existing file (`renameReplaces: false`, Obsidian mobile, D11).
+   */
+  replace?: MemReplaceMode;
+  /** Declare the capability flags of `replace` (default true). false: leave them absent (unknown platform). */
+  declareReplace?: boolean;
 }
+
+export type MemReplaceMode = 'rename' | 'atomic' | 'swap';
 
 interface PendingFault { op: FsOp; code: LocalFsErrorCode; path?: string; skip: number }
 
@@ -113,6 +125,9 @@ export class MemLocalFs implements LocalFs {
   private readonly expandFolderEvents: boolean;
   private readonly writeCreatesParents: boolean;
   emitOwnEvents: boolean;
+  readonly replaceMode: MemReplaceMode;
+  readonly atomicReplace?: boolean;
+  readonly renameReplaces?: boolean;
 
   private nodes = new Map<string, Node>();
   private nextIno = 1;
@@ -141,6 +156,11 @@ export class MemLocalFs implements LocalFs {
     this.emitOwnEvents = o.emitOwnEvents ?? true;
     this.expandFolderEvents = o.expandFolderEvents ?? false;
     this.writeCreatesParents = o.writeCreatesParents ?? false;
+    this.replaceMode = o.replace ?? "rename";
+    if (o.declareReplace ?? true) {
+      if (this.replaceMode === "atomic") this.atomicReplace = true;
+      this.renameReplaces = this.replaceMode !== "swap";
+    }
   }
 
   // ---------- keys ----------
@@ -339,8 +359,9 @@ export class MemLocalFs implements LocalFs {
     const sameNode = dst === src;                      // case-only rename on a case-insensitive fs
     // Lead decision D8: a rename from an engine replace temp (same-folder temp file) atomically
     // replaces an existing file at the target; every other rename refuses an occupied target.
+    // In 'swap' mode (D11, Obsidian mobile) no rename replaces anything.
     const replace = dst !== null && dst !== undefined && !sameNode && src.kind === "file" && dst.kind === "file" &&
-      baseName(from).startsWith(REPLACE_TEMP_PREFIX);
+      baseName(from).startsWith(REPLACE_TEMP_PREFIX) && this.replaceMode !== "swap";
     if (dst && !sameNode && !replace) throw new LocalFsError("EEXIST", to);
     if (replace && dst) this.nodes.delete(this.key(dst.name));
     if (src.kind === "folder" && (this.key(to) + "/").startsWith(this.key(from) + "/")) {
@@ -442,8 +463,9 @@ export class MemLocalFs implements LocalFs {
       else {
         this.tears.splice(ti, 1);
         const keep = Math.max(0, Math.min(data.length, t.keep ?? Math.floor(data.length * (t.fraction ?? 0.5))));
-        // The prefix lands without an event: nobody is alive to see one.
-        this.writeRaw(path, data.subarray(0, keep), opts.mtime, opts.ctime, this.writeCreatesParents, []);
+        // The prefix lands without an event: nobody is alive to see one. An atomic write (D10) tears its
+        // own hidden temp, never the target.
+        if (this.replaceMode !== "atomic") this.writeRaw(path, data.subarray(0, keep), opts.mtime, opts.ctime, this.writeCreatesParents, []);
         this.stats.writes++;
         this.torn.push({ path: nfc(path), kept: keep, of: data.length });
         t.onTear?.(path);

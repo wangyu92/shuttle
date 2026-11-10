@@ -9,7 +9,7 @@ export {
   type CommitFault, type CommitInfo, MemStateData, MemStateStore, type MemStateStoreOptions, compareKeys,
 } from "./memStateStore";
 export {
-  type FsOp, LocalFsError, MemLocalFs, type MemLocalFsOptions, type TearSpec, type TrashedItem, isLocalFsError, mergeEvents,
+  type FsOp, LocalFsError, MemLocalFs, type MemLocalFsOptions, type MemReplaceMode, type TearSpec, type TrashedItem, isLocalFsError, mergeEvents,
 } from "./memLocalFs";
 export {
   type DeviceRow, type FakeCall, type FakeMethod, FakeRemote, type FakeRemoteOptions, FakeRemoteServer, type FaultSpec,

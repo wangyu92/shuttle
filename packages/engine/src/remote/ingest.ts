@@ -262,6 +262,15 @@ export class Ingest implements ChangeSink {
         await tx.applyQueue.delete(prev.fileId);
         await dropRawHeadsIn(tx, prev.fileId, Infinity);
         purged.push(prev.fileId);
+        // design §3.4 rows S8/C5 apply in this mode only to entries in scope. An entry this device holds
+        // out of scope (excluded folder) keeps its file (I12) but its base names a record that no longer
+        // exists after the replace: detach it, so a later re-inclusion plans it as a new local file
+        // (PUSH_CREATE, as S8/C5 would have) instead of an integrity error on a missing head.
+        const e = w.entry(prev.fileId);
+        if (replace && e && e.scope !== "active" && e.synced) {
+          await w.putEntry({ ...e, synced: null, updatedAt: this.d.now() });
+          await tx.bases.delete(prev.fileId);
+        }
       }
       stored = await storeRawHeadsIn(w, raws.values());
       for (const q of bad) await quarantineIn(w, q);

@@ -102,6 +102,19 @@ export class LocalEventQueue {
     return this.deletes.size;
   }
 
+  /** A delete event for `path` is held, waiting for its matching create (rename pairing). */
+  isDeleteHeld(path: string): boolean {
+    return this.deletes.has(path);
+  }
+
+  /** The held delete of `path` was paired elsewhere (a scan saw both sides): drop the hold. */
+  releaseDelete(path: string): void {
+    const p = this.deletes.get(path);
+    if (!p) return;
+    this.d.scheduler.clearTimer(p.timer);
+    this.deletes.delete(path);
+  }
+
   // ---------- debounce ----------
 
   private debounce(path: string, raw: boolean): void {

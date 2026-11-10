@@ -1,7 +1,10 @@
 // I21 / I21b (design §3.18, §7.2): a cursor below minSeq gets CursorExpired (SNAPSHOT_REQUIRED) and
 // the snapshot resync converges per I7; purged tombstones go through S8/C5 and never delete a file.
 import { describe, expect, it } from "vitest";
-import { by, checkpoint, scripted, text } from "./helpers";
+import { by, checkpoint, scripted, text, guardSim } from "./helpers";
+
+// design §7.2 H3: console output is scanned for each seed's keyring secret.
+guardSim();
 
 describe("I21 compaction", () => {
   it("an offline device past minSeq resyncs from a snapshot and converges", async () => {

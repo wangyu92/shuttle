@@ -49,7 +49,8 @@ describe("review: torn merge + user edit", () => {
     await a.sync();
     w.clock.tick(1000);
     b.fs.seed({ "doc.md": LOCAL_EDIT }, { mtime: w.clock.now() });
-    b.fs.tearNextWrite({ path: "doc.md", keep: 10, onTear: (p) => { b.fs.external.write(p, b.fs.readText(p) + "\nuser typed tok-C\n", { mtime: w.clock.now() + 1 }); } });
+    // D8: the tear hits the merge's same-folder temp; the user keeps typing into the (intact) note.
+    b.fs.tearNextWrite({ path: "doc.md", keep: 10, onTear: () => { b.fs.external.write("doc.md", b.fs.readText("doc.md") + "\nuser typed tok-C\n", { mtime: w.clock.now() + 1 }); } });
     b.engine.requestScan();
     // drive beta until the tear happened
     for (let i = 0; i < 20 && b.fs.torn.length === 0; i++) {
@@ -129,8 +130,9 @@ describe("review: torn merge + CONFLICT", () => {
     a.engine.requestScan();
     for (let i = 0; i < 5; i++) { await a.flushEvents(); await a.engine.runOnce(); }
     let torn = "";
-    b.fs.tearNextWrite({ path: "doc.md", keep: 25, onTear: () => {
-      torn = b.fs.readText("doc.md")!;
+    b.fs.tearNextWrite({ path: "doc.md", keep: 25, onTear: (p) => {
+      // D8: the torn bytes sit in the merge's same-folder temp, never in the note.
+      torn = b.fs.readText(p)!;
       // the file cannot be read for a while (e.g. the disk keeps failing), so the torn file is not repaired yet
       for (let i = 0; i < 6; i++) b.fs.failNext("read", "EIO", { path: "doc.md" });
       for (let i = 0; i < 6; i++) b.fs.failNext("stat", "EIO", { path: "doc.md" });
@@ -156,6 +158,7 @@ describe("review: torn merge + CONFLICT", () => {
     const betaText = [...b.fs.files().values()].map((x) => new TextDecoder().decode(x)).join("|");
     expect(betaText).toContain("tok-B");
     expect(betaText).toContain("tok-A2");
-    expect(b.engine.log.entries().map((e: any) => e.key)).toContain("log.tornMergeRestored");
+    // D8: the note itself was never torn, so there is nothing to restore from history.
+    expect([...b.fs.files().keys()].some((k) => k.includes(".shuttle-replace-"))).toBe(false);
   });
 });

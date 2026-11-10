@@ -246,16 +246,19 @@ export class Store {
   }
 
   /**
-   * A device has seen seqs above the server's head (design §2.6.1, restore that also restored hwm.json):
-   * raise head_seq so no seq is reused and start the rollback rule.
+   * Raise head_seq to `to` because a device has seen seqs above it (design §2.6.1). The caller has
+   * already decided the raise is trusted and capped (Server.noteSeen, lead decision D9). restored_seq
+   * keeps the lowest head seen before any raise. An existing rollback_at is kept: the server's data did
+   * not change, so devices that already accepted this restore need no second snapshot, and a client
+   * that keeps reporting a high value cannot restart the rule on every hello.
    */
-  raiseHeadForSeen(vid: string, seen: Seq): boolean {
+  raiseHeadForSeen(vid: string, to: Seq): boolean {
     return txImmediate(this.s.db, () => {
       const v = this.vault(vid);
-      if (!v || seen <= v.head_seq) return false;
+      if (!v || to <= v.head_seq) return false;
       this.s.run(
-        `UPDATE vaults SET restored_seq = COALESCE(MIN(restored_seq, head_seq), head_seq), head_seq = ?, rollback_at = ?
-         WHERE vault_id = ?`, seen, this.now(), vid);
+        `UPDATE vaults SET restored_seq = COALESCE(MIN(restored_seq, head_seq), head_seq), head_seq = ?,
+         rollback_at = COALESCE(rollback_at, ?) WHERE vault_id = ?`, to, this.now(), vid);
       return true;
     });
   }

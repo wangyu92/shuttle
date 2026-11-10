@@ -5,7 +5,10 @@ import { optionsFromEnv, resolveConfig } from "../src/config";
 import { etagMatches } from "../src/server-core";
 import { b64uDecodeStrict } from "../src/util";
 import { clientIp } from "../src/rest";
-import { FAST_SCRYPT, TestWs, cid, fileId, fixture, login, pathKey, putOp, removeDir, start, tempDir } from "./helpers";
+import { FAST_SCRYPT, TestWs, cid, fileId, fixture, login, pathKey, putOp, removeDir, start, tempDir, guardSuite } from "./helpers";
+
+// design §7.2 H3: logs, admin output and console are scanned for the password and tokens.
+guardSuite();
 
 describe("auth helpers", () => {
   it("enroll codes carry 100 bits and normalize Crockford aliases", () => {

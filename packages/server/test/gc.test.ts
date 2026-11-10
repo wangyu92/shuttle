@@ -7,8 +7,11 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { RunningServer } from "../src/server";
 import {
   FakeTime, TestWs, api, archiveOp, blobId, cid, createVault, delOp, fileId, fixture, pathKey, putBlob, putOp, removeDir,
-  sealed, sha256, sleep, start, tempDir, type Client,
+  sealed, sha256, sleep, start, tempDir, type Client, guardSuite,
 } from "./helpers";
+
+// design §7.2 H3: logs, admin output and console are scanned for the password and tokens.
+guardSuite();
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;

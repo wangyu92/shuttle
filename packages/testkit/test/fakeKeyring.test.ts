@@ -4,6 +4,10 @@ import { SxKeyring } from "@shuttle/crypto";
 import type { Keyring, RecordHeader } from "@shuttle/protocol";
 import { isBlobId, isPathKey, isB64u } from "@shuttle/protocol";
 import { FakeKeyring, Prng, TestIds } from "../src/index";
+import { guardOutput } from "./outputGuard";
+
+// design §7.2 H3: console output is scanned for the keyring secrets and the VMK bytes used here.
+guardOutput({ name: "default fake secret", value: "fake-secret" }, { name: "test VMK", value: new Uint8Array(32).fill(7) });
 
 type Assignable<A, B> = [A] extends [B] ? true : false;
 const yes = <T extends true>(): T => true as T;

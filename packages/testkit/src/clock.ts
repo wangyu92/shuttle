@@ -5,12 +5,11 @@
 
 import type { Clock, Scheduler, TimerHandle } from "@shuttle/protocol";
 
-// Captured at load so tests that install fake global timers do not freeze our macrotask drain.
-const realSetTimeout: typeof setTimeout = globalThis.setTimeout.bind(globalThis);
+import { macrotask } from "./macrotask";
 
 /** Resolve after every queued microtask (and microtasks they queue) has run. */
 export function drainMicrotasks(): Promise<void> {
-  return new Promise((resolve) => { realSetTimeout(resolve, 0); });
+  return new Promise((resolve) => { macrotask(() => resolve()); });
 }
 
 export interface FakeClockOptions {

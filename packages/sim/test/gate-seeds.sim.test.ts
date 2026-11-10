@@ -8,6 +8,7 @@
 //  plus D, F, G, H seeds that no longer fail after the fixes above.
 import { describe, expect, it } from "vitest";
 import { replayCommand, runSim } from "../src/index";
+import { guardSim } from "./helpers";
 
 const SEEDS = [
   127, 186, 328, 373, 467, 503, 574, 611, 624, 683, 691, 717, 726, 859, 993, // A
@@ -21,6 +22,9 @@ const SEEDS = [
   163,                                                                          // I
   1004, 1093,                                                                   // fresh-seed ghosts (eviction catch-up)
 ];
+
+// design §7.2 H3: console output is scanned for each seed's keyring secret.
+guardSim(...SEEDS);
 
 describe("sim gate seeds (P1 part 4)", () => {
   it(`${SEEDS.length} former failing seeds pass in the default configuration`, async () => {

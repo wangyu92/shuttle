@@ -11,9 +11,13 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { ChangeBatch, CommitOp, VaultInfo, WsFactory, WsLike } from "@shuttle/protocol";
 import { TestIds } from "@shuttle/testkit";
 import { startServer, type RunningServer, type ServerOptions } from "../../server/src/server";
-import { addUser, login, sealed, type Client } from "../../server/test/helpers";
+import { addUser, guardSuite, login, sealed, type Client } from "../../server/test/helpers";
+import { guardLog } from "../../testkit/test/outputGuard";
 import { ServerAdapter, fetchHttpClient, serverEnroll, serverLogin, type ServerAdapterOptions } from "../src/index";
 import { RecSink, memState } from "./fakes";
+
+// design §7.2 H3: server logs and console are scanned for the password and every login token.
+guardSuite();
 
 const ROOT = path.join(os.homedir(), "tmp/claude/shuttle-p1/adapter-test");
 const ids = new TestIds("int");
@@ -30,7 +34,7 @@ function options(extra: Partial<ServerOptions> = {}): ServerOptions {
   return {
     host: "127.0.0.1", port: 0, dataDir: dir, jobs: false, scrypt: { N: 1024, r: 8, p: 1 },
     rates: { commitsPerSec: 100_000, blobReqPerSec: 100_000, loginFailuresPerMin: 50 },
-    sourceUrl: "https://example.com/shuttle/source", coalesceMs: 5, log: () => undefined, ...extra,
+    sourceUrl: "https://example.com/shuttle/source", coalesceMs: 5, log: guardLog, ...extra,
   };
 }
 
@@ -278,6 +282,24 @@ describe("history, usage, devices, pairing", () => {
     expect((await a.listVersions(op.fileId)).records.map((r) => r.seq)).toEqual([s2, s1]);
     expect((await a.listDeleted()).records.map((r) => r.fileId)).toEqual([op.fileId]);
     expect(await a.usage()).toMatchObject({ exact: true, quotaBytes: null });
+  });
+
+  it("REST pull reports seen.maxSeq like the hello (D9); outside a restore the server ignores it", async () => {
+    const urls: string[] = [];
+    const rec = { request: (r: Parameters<typeof http.request>[0]) => { urls.push(r.url); return http.request(r); } };
+    const { a, vid } = await vault();
+    await a.commit({ cid: randomUUID(), ops: [ids.put()] });
+    const b = mk(owner.token, vid, { http: rec, state: memState({ "shuttle-server.epoch": 1 }), session: () => ({ seenMaxSeq: 50, rollbackAck: null }) });
+    const page = await b.pull(0);
+    expect(page.headSeq).toBe(1);
+    expect(page.records).toHaveLength(1);
+    const q = new URL(urls.find((u) => u.includes("/changes?"))!).searchParams;
+    expect(q.get("seenMaxSeq")).toBe("50");
+    // Not sent when it adds nothing to `since`.
+    const c = mk(owner.token, vid, { http: rec, state: memState({ "shuttle-server.epoch": 1 }), session: () => ({ seenMaxSeq: 1, rollbackAck: null }) });
+    urls.length = 0;
+    await c.pull(1);
+    expect(new URL(urls.find((u) => u.includes("/changes?"))!).searchParams.has("seenMaxSeq")).toBe(false);
   });
 
   it("devices, revoke closes the revoked device's feed with auth-error and no reconnect", async () => {

@@ -3,7 +3,10 @@
 // a device that never syncs.
 import { describe, expect, it } from "vitest";
 import { runSim } from "../src/index";
-import { by, scripted } from "./helpers";
+import { by, scripted, guardSim } from "./helpers";
+
+// design §7.2 H3: console output is scanned for each seed's keyring secret.
+guardSim();
 
 describe("I7 convergence", () => {
   it("no-fault random runs on 2 to 4 devices converge at every checkpoint", async () => {

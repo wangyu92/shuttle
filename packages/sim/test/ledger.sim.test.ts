@@ -2,7 +2,10 @@
 // that the oracle itself catches a loss.
 import { describe, expect, it } from "vitest";
 import { noteBytes, noteLines } from "../src/index";
-import { by, checkpoint, scripted } from "./helpers";
+import { by, checkpoint, scripted, guardSim } from "./helpers";
+
+// design §7.2 H3: console output is scanned for each seed's keyring secret.
+guardSim();
 
 describe("I6 ledger", () => {
   it("concurrent edits on three devices keep every token (merge or conflict copy)", async () => {

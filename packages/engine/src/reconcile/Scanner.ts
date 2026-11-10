@@ -3,6 +3,7 @@
 // hashing is deferred to reconcile().
 
 import type { FileKind, LocalFs, Scheduler } from "@shuttle/protocol";
+import { isReplaceTemp, replaceInFlight } from "../apply/replaceFile";
 import type { FileIndex } from "../index/FileIndex";
 import { normalizePath } from "../path/normalize";
 import type { DirtyKey, DirtyReason } from "../types";
@@ -43,7 +44,12 @@ export async function scanLocal(d: ScanDeps, mode: 'fast' | 'full'): Promise<Sca
       const sc = d.scopeOf(p, st.size);
       const e = d.index.byPath(p);
       if (!e) {
-        if (sc === "ignored") continue;
+        if (sc === "ignored") {
+          // D8: a replace temp left by a crash or a torn write before its rename. The target is whole;
+          // the temp holds nothing that is not in the state store (intent/staging) or on the remote.
+          if (isReplaceTemp(p) && !replaceInFlight(d.fs, p)) await d.fs.remove(p, "delete").catch(() => undefined);
+          continue;
+        }
         if (sc !== "active") {
           await d.index.trackOutOfScope({ fileId: (d.newFileId ?? newFileId)(), st, scope: sc, kind: d.kindOf(p) });
           r.tracked++;
@@ -74,6 +80,59 @@ export async function scanLocal(d: ScanDeps, mode: 'fast' | 'full'): Promise<Sca
   }
   d.emptyVaultCheck?.({ seen: seen.size, indexedActive: d.index.activeCount() });
   return r;
+}
+
+export interface ScanMark { key: DirtyKey; reason: DirtyReason }
+
+export interface PairDeps {
+  index: FileIndex;
+  /** Content hash of the file at `path` now, null when unreadable. */
+  hashNow(path: string): Promise<string | null>;
+  /** A delete event for `path` is held by the event queue (design §3.5 delete hold). */
+  isDeleteHeld(path: string): boolean;
+  /** Apply the rename rule (design §3.6.1) for a pair this scan found; drops any hold on `from`. */
+  rename(from: string, to: string): Promise<void>;
+}
+
+/**
+ * design §3.5 rename pairing for a scan (move = delete + create with the same content). A scan that
+ * lands between a move's delete and its create (a watcher that reports in two pieces, or the periodic
+ * fast scan, §3.14) sees the old path missing and the new one untracked. Pushed as they are, the move
+ * would become a delete plus a create. For a missing entry whose delete event the queue is holding, the
+ * scan pairs it the way the event queue would: same size, then the same hash as the entry's last
+ * observation. A held entry that found no partner is left to the hold (its expiry marks it missing).
+ * Returns the marks that remain.
+ */
+export async function pairScanRenames(marks: readonly ScanMark[], d: PairDeps): Promise<ScanMark[]> {
+  // Only moves whose delete the event queue is holding right now: pairing any missing entry with any
+  // same-content new file would also re-key unrelated files (a copy, a rebuild-from-scan).
+  const missing = marks.filter((m) => m.reason === "missing" && m.key.fileId !== undefined && d.isDeleteHeld(m.key.path));
+  const fresh = marks.filter((m) => m.reason === "new" && m.key.fileId === undefined && m.key.stat !== undefined);
+  if (missing.length === 0) return [...marks];
+  const drop = new Set<ScanMark>();
+  if (fresh.length > 0) {
+    const bySize = new Map<number, ScanMark[]>();
+    for (const m of fresh) {
+      const size = m.key.stat!.size;
+      bySize.set(size, [...(bySize.get(size) ?? []), m]);
+    }
+    const hashes = new Map<string, string | null>();
+    for (const m of missing) {
+      const e = m.key.fileId ? d.index.byFileId(m.key.fileId) : null;
+      if (!e?.obs?.hash || e.path !== m.key.path) continue;
+      const cands = (bySize.get(e.obs.size) ?? []).filter((c) => !drop.has(c));
+      for (const c of cands) {
+        if (!hashes.has(c.key.path)) hashes.set(c.key.path, await d.hashNow(c.key.path));
+        if (hashes.get(c.key.path) !== e.obs.hash) continue;
+        drop.add(m);
+        drop.add(c);
+        await d.rename(e.path, c.key.path);
+        break;
+      }
+    }
+  }
+  for (const m of missing) drop.add(m);
+  return marks.filter((m) => !drop.has(m));
 }
 
 /** design §3.3.2 localChanged(e). */

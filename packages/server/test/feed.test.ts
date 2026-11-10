@@ -3,8 +3,11 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { RunningServer } from "../src/server";
 import {
-  TestWs, api, archiveOp, cid, delOp, fileId, fixture, login, makeInfo, pathKey, putOp, removeDir, sleep, start, tempDir, type Client,
+  TestWs, api, archiveOp, cid, delOp, fileId, fixture, login, makeInfo, pathKey, putOp, removeDir, sleep, start, tempDir, type Client, guardSuite,
 } from "./helpers";
+
+// design §7.2 H3: logs, admin output and console are scanned for the password and tokens.
+guardSuite();
 
 let srv: RunningServer;
 let dir: string;

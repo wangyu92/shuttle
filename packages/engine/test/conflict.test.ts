@@ -2,6 +2,7 @@
 // the remote head's content, and the copy is written before the original is overwritten.
 
 import { describe, expect, it } from "vitest";
+import { isReplaceTemp } from "../src/index";
 import type { World } from "./harness";
 import { Node, makeWorld, serverMap, sortedEntries, syncAll } from "./engineHarness";
 
@@ -45,7 +46,8 @@ describe("I10 conflict copy content", () => {
     expect(b.fs.readText("n.md")).toBe("alpha line\n");
     // Copy first: B's bytes are at the copy path before the original receives the remote bytes.
     const copyAt = firstPut(b, (p) => p.includes("Conflicted copy"));
-    const origAt = b.fsOps.findIndex((o, i) => i > copyAt && o.op === "write" && o.path === "n.md");
+    // D8: the original receives the remote bytes through a same-folder replace temp.
+    const origAt = b.fsOps.findIndex((o, i) => i > copyAt && o.op === "write" && (o.path === "n.md" || isReplaceTemp(o.path)));
     expect(copyAt).toBeGreaterThanOrEqual(0);
     expect(origAt).toBeGreaterThan(copyAt);
     expect(sortedEntries(await a.diskMap())).toEqual(sortedEntries(await serverMap(w)));

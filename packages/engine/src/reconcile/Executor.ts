@@ -17,6 +17,7 @@ import type { FileEntry, FileId, Keyring, LocalFs, RemoteAdapter, RemoteHead, Re
 import { isStateStoreError } from "@shuttle/protocol";
 import type { RemoteApplier } from "../apply/RemoteApplier";
 import type { WriteIntents } from "../apply/WriteIntents";
+import { replaceFile } from "../apply/replaceFile";
 import type { BlobPipeline } from "../content/BlobPipeline";
 import { sha256Hex } from "../content/hash";
 import { IntegrityError } from "../errors";
@@ -65,6 +66,8 @@ export interface ExecutorDeps {
   tzOffset?(epochMs: number): number;
   mergeOptions?: MergeOptions;
   log?(e: ExecLog): void;
+  /** The remote is reachable now (an archive op can be pushed this iteration). Absent: assumed true. */
+  connected?(): boolean;
   /** INTEGRITY_ERROR (design §3.4.3): part 3 schedules snapshotResync. */
   scheduleResync?(reason: string): void;
   /** After FORGET, LOCAL_DELETE and renames: LocalRenames.retry(). */
@@ -283,6 +286,14 @@ export class Executor implements ActionExecutor {
     const d = this.d;
     const R = d.index.remote.byFileId(a.fileId);
     if (!R || !L) return;
+    if (R.deleted || R.contentHash !== L.hash || R.path !== a.path) {
+      // The plan used a head that moved on meanwhile (row P1 takes the holder from a PATH_TAKEN commit
+      // result, which can be older than the mirror): plan again against the current head. Adopting a
+      // head that moved elsewhere would re-key the entry to the new path and leave the local file at
+      // the old one untracked (sim seed 525).
+      d.markDirty(c.entry ? { fileId: c.entry.fileId, path: L.path } : { path: L.path }, "remote");
+      return;
+    }
     const replaces = a.replaces ?? (c.entry && c.entry.fileId !== a.fileId ? c.entry.fileId : undefined);
     if (replaces) await d.journal.cancel(replaces);
     await d.journal.cancel(a.fileId);
@@ -350,8 +361,11 @@ export class Executor implements ActionExecutor {
         await this.pushMerged(a, c, L.path);
         return;
       }
-      if (local.length <= ARCHIVE_STAGE_MAX) {
+      if (local.length <= ARCHIVE_STAGE_MAX && d.connected?.() !== false) {
         // Remote wins: archive the local bytes first (staged, durable), then pull (design §3.10.4, I31).
+        // Offline, the staged archive would wait in the state store alone, which an eviction (iOS,
+        // design §3.3.5) takes with it while the pull already replaced the file (sim seed 721): keep the
+        // local bytes on disk as a conflict copy instead (I6).
         await this.enqueue({ kind: "archive", fileId: R.fileId, path: L.path, base: R.seq, staged: local, mtime: L.mtime });
         await this.crash("exec:archived");
         await d.applier.applyLocked(R.fileId, { planned: true, ...(a.replaces ? { replaces: a.replaces } : {}) });
@@ -515,6 +529,17 @@ export class Executor implements ActionExecutor {
       }
     }
     const copy = await this.freeConflictPath(a.path);
+    if (a.pull) {
+      // The pull below must survive a crash after the rename: once the local file sits under the copy
+      // name, nothing else would bring the remote file in (no entry, no queue row; I7 liveness).
+      const pull = a.pull;
+      const R = d.index.remote.byFileId(pull.fileId);
+      if (R && !R.deleted) {
+        await d.state.tx(["applyQueue"], async (tx) => {
+          if (!(await tx.applyQueue.get(pull.fileId))) await tx.applyQueue.put({ fileId: pull.fileId, seq: R.seq, enqueuedAt: d.now(), attempts: 0 });
+        });
+      }
+    }
     if (!(await this.localRename(a.fileId, L.path, copy))) return;
     if (a.fileId && !d.index.remote.byFileId(a.fileId)) {
       // The renamed file's own head is gone (an epoch re-create that lost its path, P1): its old base
@@ -614,7 +639,8 @@ export class Executor implements ActionExecutor {
     d.echo.expect(path, { hash: h, size: bytes.length });
     let st;
     try {
-      st = await d.fs.write(path, bytes, { mtime: d.now() });
+      // D8: through a same-folder temp + rename, so a torn write never destroys the pre-merge file.
+      st = await replaceFile(d.fs, path, bytes, { mtime: d.now() });
     } catch (err) {
       // Write failed in this session. Untouched file: drop the staged merge and re-plan from scratch.
       // Anything else (torn, gone): keep it; the torn check re-applies the staged merge (D1).

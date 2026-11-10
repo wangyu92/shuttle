@@ -62,7 +62,10 @@ export interface TearSpec {
   keep?: number;
   /** Fraction of the new content that reaches the disk (used when `keep` is absent). */
   fraction?: number;
-  /** Skip this many matching writes first. */
+  /**
+   * Skip this many matching writes first. A write to an engine replace temp in the folder of `path`
+   * matches too (D8: the engine writes `path` through such a temp).
+   */
   skip?: number;
   /**
    * Called after the prefix is on disk, before the write fails (e.g. kill the state store to model
@@ -80,6 +83,17 @@ const dec = new TextDecoder("utf-8", { fatal: false });
 function nfc(p: string): string {
   return p.normalize("NFC");
 }
+/**
+ * Basename prefix of the engine's replace temps (lead decision D8; engine apply/replaceFile.ts, which
+ * testkit cannot import). A rename from such a name may replace an existing file.
+ */
+export const REPLACE_TEMP_PREFIX = ".shuttle-replace-";
+
+function baseName(p: string): string {
+  const i = p.lastIndexOf("/");
+  return i < 0 ? p : p.slice(i + 1);
+}
+
 function parentOf(p: string): string {
   const i = p.lastIndexOf("/");
   return i < 0 ? "" : p.slice(0, i);
@@ -323,7 +337,12 @@ export class MemLocalFs implements LocalFs {
     if (!src) throw new LocalFsError("ENOENT", from);
     const dst = this.get(to);
     const sameNode = dst === src;                      // case-only rename on a case-insensitive fs
-    if (dst && !sameNode) throw new LocalFsError("EEXIST", to);
+    // Lead decision D8: a rename from an engine replace temp (same-folder temp file) atomically
+    // replaces an existing file at the target; every other rename refuses an occupied target.
+    const replace = dst !== null && dst !== undefined && !sameNode && src.kind === "file" && dst.kind === "file" &&
+      baseName(from).startsWith(REPLACE_TEMP_PREFIX);
+    if (dst && !sameNode && !replace) throw new LocalFsError("EEXIST", to);
+    if (replace && dst) this.nodes.delete(this.key(dst.name));
     if (src.kind === "folder" && (this.key(to) + "/").startsWith(this.key(from) + "/")) {
       throw new LocalFsError("EIO", to, "cannot move a folder into itself");
     }
@@ -412,7 +431,11 @@ export class MemLocalFs implements LocalFs {
 
   async write(path: string, data: Uint8Array, opts: { mtime: number; ctime?: number }): Promise<LocalStat> {
     await this.enter("write", path);
-    const ti = this.tears.findIndex((t) => t.path === undefined || this.key(t.path) === this.key(path));
+    // A tear aimed at `path` also hits a replace temp in its folder: the engine writes merges and pull
+    // applies through one (lead decision D8), so that is the write a crash would tear.
+    const viaTemp = (t: TearSpec): boolean => t.path !== undefined && baseName(path).startsWith(REPLACE_TEMP_PREFIX) &&
+      this.key(parentOf(path)) === this.key(parentOf(t.path));
+    const ti = this.tears.findIndex((t) => t.path === undefined || this.key(t.path) === this.key(path) || viaTemp(t));
     if (ti >= 0) {
       const t = this.tears[ti] as TearSpec;
       if ((t.skip ?? 0) > 0) t.skip = (t.skip ?? 0) - 1;

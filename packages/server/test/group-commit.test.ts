@@ -8,7 +8,10 @@ import type { CommitRequest, OpResult, VersionRecord } from "@shuttle/protocol";
 import { resolveConfig } from "../src/config";
 import { Server } from "../src/server-core";
 import { HttpError } from "../src/util";
-import { TestWs, cid, fileId, fixture, login, makeInfo, pathKey, putOp, removeDir, start, tempDir, testOptions, vaultId } from "./helpers";
+import { TestWs, cid, fileId, fixture, login, makeInfo, pathKey, putOp, removeDir, start, tempDir, testOptions, vaultId, guardSuite } from "./helpers";
+
+// design §7.2 H3: logs, admin output and console are scanned for the password and tokens.
+guardSuite();
 
 type Exec = (sql: string) => void;
 

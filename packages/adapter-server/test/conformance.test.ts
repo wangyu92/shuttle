@@ -13,9 +13,13 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { ChangeBatch, OpResult, RemoteAdapter, VersionRecord, WsFactory, WsLike } from "@shuttle/protocol";
 import { FakeRemoteServer, TestIds } from "@shuttle/testkit";
 import { startServer, type RunningServer } from "../../server/src/server";
-import { addUser, login, sealed } from "../../server/test/helpers";
+import { addUser, guardSuite, login, sealed } from "../../server/test/helpers";
+import { guardLog } from "../../testkit/test/outputGuard";
 import { ServerAdapter, fetchHttpClient } from "../src/index";
 import { RecSink, memState } from "./fakes";
+
+// design §7.2 H3: server logs and console are scanned for the password and every login token.
+guardSuite();
 
 interface Pair { a: RemoteAdapter; b: RemoteAdapter; vaultId: string; close(): Promise<void> }
 type Factory = () => Promise<Pair>;
@@ -180,7 +184,7 @@ beforeAll(async () => {
   await mkdir(ROOT, { recursive: true });
   dir = await mkdtemp(path.join(ROOT, "conf-"));
   srv = await startServer({
-    host: "127.0.0.1", port: 0, dataDir: dir, jobs: false, scrypt: { N: 1024, r: 8, p: 1 }, coalesceMs: 5, log: () => undefined,
+    host: "127.0.0.1", port: 0, dataDir: dir, jobs: false, scrypt: { N: 1024, r: 8, p: 1 }, coalesceMs: 5, log: guardLog,
     rates: { commitsPerSec: 100_000, blobReqPerSec: 100_000, loginFailuresPerMin: 50 }, sourceUrl: "https://example.com/shuttle/source",
   });
   await addUser(dir, "alice");

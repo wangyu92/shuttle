@@ -8,6 +8,7 @@ import { WS_PATH, WS_SUBPROTOCOL } from "@shuttle/protocol";
 import type { CommitOp, CommitResultMsg, HelloMsg, VaultInfoEnvelope } from "@shuttle/protocol";
 import { runAdmin } from "../src/adminCli";
 import { startServer, type RunningServer, type ServerOptions } from "../src/server";
+import { guardLog, guardOutput, noteSecret, type OutputGuard } from "../../testkit/test/outputGuard";
 
 // Never os.tmpdir(): the system temp dir is RAM on the NAS (design §8.2).
 export const TEST_ROOT = path.join(os.homedir(), "tmp/claude/shuttle-p1/server-test");
@@ -33,8 +34,17 @@ export function testOptions(dataDir: string, extra: Partial<ServerOptions> = {})
   return {
     host: "127.0.0.1", port: 0, dataDir, jobs: false, scrypt: FAST_SCRYPT,
     rates: { commitsPerSec: 100_000, blobReqPerSec: 100_000, loginFailuresPerMin: 5 },
-    sourceUrl: "https://example.invalid/shuttle", ...extra,
+    sourceUrl: "https://example.invalid/shuttle", log: guardLog, ...extra,
   };
+}
+
+/**
+ * design §7.2 H3: call once at the top of a server suite. Server logs (testOptions), admin CLI output
+ * (silentIo) and the console are captured and scanned in afterAll for the password and every token
+ * handed out by login().
+ */
+export function guardSuite(): OutputGuard {
+  return guardOutput({ name: "password", value: PASSWORD });
 }
 
 export async function start(dataDir: string, extra: Partial<ServerOptions> = {}): Promise<RunningServer> {
@@ -69,7 +79,10 @@ export function silentIo(dataDir: string, password = PASSWORD) {
   const out: string[] = [];
   const err: string[] = [];
   return {
-    io: { dataDir, out: (l: string) => out.push(l), err: (l: string) => err.push(l), readPassword: async () => password, scrypt: FAST_SCRYPT },
+    io: {
+      dataDir, readPassword: async () => password, scrypt: FAST_SCRYPT,
+      out: (l: string) => { out.push(l); guardLog(l); }, err: (l: string) => { err.push(l); guardLog(l); },
+    },
     out, err,
   };
 }
@@ -89,6 +102,7 @@ export async function login(srv: RunningServer, username: string, deviceName = "
   });
   if (r.status !== 200) throw new Error(`login ${r.status} ${await r.text()}`);
   const b = (await r.json()) as { token: string; deviceId: string };
+  noteSecret({ name: "device token", value: b.token });
   return { token: b.token, deviceId: b.deviceId, auth: { Authorization: `Bearer ${b.token}` } };
 }
 

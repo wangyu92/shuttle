@@ -1,11 +1,13 @@
 // D1 (lead decision, 클로드 제안(미승인)): torn or interrupted merge writes. The merged plaintext is
 // staged with its push op and the write intent before the file is written, so after a crash at ANY
 // point, or a non-atomic write that tears, the file ends as the merged text: never the remote head
-// and never the torn bytes (I6, I30, design §3.8.4, §3.10.2).
+// and never the torn bytes (I6, I30, design §3.8.4, §3.10.2). Lead decision D8: the merge write goes
+// through a same-folder temp and a rename, so a tear hits the temp and the note keeps its pre-merge
+// text until the merged bytes are in place.
 
 import { describe, expect, it } from "vitest";
 import type { VersionRecord, WriteIntent } from "@shuttle/protocol";
-import { decodeRecord } from "../src/index";
+import { decodeRecord, isReplaceTemp } from "../src/index";
 import { Crash } from "./harness";
 import { sha256HexSync } from "./sha256";
 import { Node, isCrashLike, makeWorld, serverMap, syncAll } from "./engineHarness";
@@ -98,10 +100,12 @@ describe("D1 torn merge writes", () => {
   it("the merge write itself tears and the process dies with it: restart re-applies the staged merge", async () => {
     const { w, a, b } = await setup("d1-tear-kill");
     let half = "";
+    let tornPath = "";
     b.fs.tearNextWrite({
       path: "doc.md", fraction: 0.4,
-      onTear: () => {
-        half = b.fs.readText("doc.md") ?? "";
+      onTear: (p) => {
+        tornPath = p;
+        half = b.fs.readText(p) ?? "";
         b.crashed = true;
         b.store.crash();
         throw new Crash("torn write");
@@ -111,18 +115,22 @@ describe("D1 torn merge writes", () => {
     expect(b.fs.torn.length).toBe(1);
     expect(half.length).toBeGreaterThan(0);
     expect(MERGED.startsWith(half)).toBe(true);
+    // D8: the tear hit the same-folder temp; the note still holds the pre-merge local edit.
+    expect(isReplaceTemp(tornPath)).toBe(true);
+    expect(b.fs.readText("doc.md")).toBe(LOCAL_EDIT);
     await b.restart();
     await syncAll([a, b], 60);
     await expectMerged(w, a, b, sha256HexSync(enc(half)));
   });
 
-  it("the merge write fails with EIO in session (no crash): the torn file is restored from staging", async () => {
+  it("the merge write fails with EIO in session (no crash): the note is never torn, the merge is planned again", async () => {
     const { w, a, b } = await setup("d1-tear-eio");
     b.fs.tearNextWrite({ path: "doc.md", keep: 10 });
     await syncAll([a, b], 60);
     expect(b.fs.torn.length).toBe(1);
+    // D8: only the temp was torn (and removed); the note went from the local edit to the merge.
+    expect(isReplaceTemp(b.fs.torn[0]!.path)).toBe(true);
     await expectMerged(w, a, b, sha256HexSync(enc(MERGED.slice(0, 10))));
-    expect(b.engine.log.entries().some((e) => e.key === "log.tornMergeRestored")).toBe(true);
   });
 
   it("the merge write fails before any byte lands: the staged merge is dropped and planned again", async () => {
@@ -137,7 +145,7 @@ describe("D1 torn merge writes", () => {
     b.crashAt = 0;
     let crashedAtStage = false;
     const d = b.fs.before((op, p) => {
-      if (op === "write" && p === "doc.md" && !crashedAtStage) {
+      if (op === "write" && (p === "doc.md" || isReplaceTemp(p)) && !crashedAtStage) {
         crashedAtStage = true;
         b.crashed = true;
         b.store.crash();

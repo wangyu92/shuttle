@@ -3,6 +3,10 @@ import { describe, expect, it } from "vitest";
 import { CloseCode, DEFAULT_LIMITS } from "@shuttle/protocol";
 import { closeAction, codeFromStatus, errorFromResponse, networkError, normalizeBaseUrls, wsUrlOf } from "../src/index";
 import { harness, json, VID } from "./fakes";
+import { guardOutput } from "../../testkit/test/outputGuard";
+
+// design §7.2 H3: console output is scanned for the test device token.
+guardOutput({ name: "device token", value: "sxd_test" });
 
 const enc = new TextEncoder();
 const raw = (status: number, text: string, headers: Record<string, string> = {}) => ({ status, headers, body: enc.encode(text).buffer as ArrayBuffer });

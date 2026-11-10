@@ -320,6 +320,9 @@ export class ServerAdapter implements RemoteAdapter {
     // design §2.6.1: an accepted restore is acked on REST pulls too (the rollback resync's catch-up).
     const s = this.o.session ? await this.o.session() : {};
     if (s.rollbackAck !== undefined && s.rollbackAck !== null) q.set("rollbackAck", String(s.rollbackAck));
+    // design §2.6.1 / lead decision D9: the REST pull reports seen.maxSeq exactly like the WS hello.
+    const seen = s.seenMaxSeq !== undefined ? s.seenMaxSeq : this.seenMaxSeq;
+    if (seen !== null && seen > since) q.set("seenMaxSeq", String(seen));
     const { data } = await this.rest.json("GET", `${this.vpath()}/changes?${q.toString()}`, "pull");
     const r = need(validateChangesResponse(data), "pull");
     if (r.from !== since) throw remoteError("PROTOCOL", `pull: asked from ${since}, got ${r.from}`);

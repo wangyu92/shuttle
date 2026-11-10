@@ -1,6 +1,9 @@
 // I16 no echo uploads (design §3.18, §7.2): applying N remote changes produces 0 commits on receivers.
 import { describe, expect, it } from "vitest";
-import { by, checkpoint, commitsOf, scripted, text } from "./helpers";
+import { by, checkpoint, commitsOf, scripted, text, guardSim } from "./helpers";
+
+// design §7.2 H3: console output is scanned for each seed's keyring secret.
+guardSim();
 
 describe("I16 echo", () => {
   it("receivers of creates, edits, moves and deletes commit nothing", async () => {

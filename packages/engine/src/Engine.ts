@@ -32,7 +32,7 @@ import { Reconciler, type ActionExecutor, type ExecContext, type ReconcileSettin
 import type { Action, PlanCtx } from "./reconcile/Planner";
 import { DirtySet } from "./reconcile/DirtySet";
 import { LocalRenames } from "./reconcile/LocalRenames";
-import { markPendingLocalChanges, scanLocal } from "./reconcile/Scanner";
+import { markPendingLocalChanges, pairScanRenames, scanLocal } from "./reconcile/Scanner";
 import { EchoSuppressor } from "./events/EchoSuppressor";
 import { LocalEventQueue } from "./events/LocalEventQueue";
 import type { EventTimings } from "./events/timing";
@@ -201,6 +201,9 @@ class MemSeenStore implements SeenStore {
  */
 export const DELETE_BURST_GRACE_MS = 60_000;
 
+/** meta.filterFingerprint while a filter change waits for its rescope (never a real fingerprint). */
+const RESCOPE_PENDING = "rescope-pending";
+
 export function createEngine(deps: EngineDeps, opts: EngineOptions = {}): ShuttleEngine {
   return new ShuttleEngine(deps, opts);
 }
@@ -276,6 +279,16 @@ export class ShuttleEngine implements Engine {
   private torn: Array<{ path: string; fileId: FileId }> = [];
   private scanDue: 'fast' | 'full' | null = "fast";
   private rescopeDue = false;
+  /** The last subscribe went out with since = null: no snapshot was ever applied (design §2.9.1). */
+  private neverBootstrapped = false;
+  /** vault-info of a rebuildRemote() whose outcome is unknown (answer and re-read both lost). */
+  private unconfirmedRebuild: VaultInfo | null = null;
+  /**
+   * Out-of-scope entries a filter change re-included whose file was on disk at the change (design §3.11,
+   * I12, D6). If such a file is gone when the rescope runs, the user deleted it in scope after the
+   * change: a real delete (row S5), not a copy that vanished while excluded.
+   */
+  private reincludedPresent = new Set<FileId>();
   private startup: StartupClass = "normal";
 
   // guards state
@@ -421,6 +434,15 @@ export class ShuttleEngine implements Engine {
     this.torn = await this.intents.startupCheck();
     await this.runner.resume();
     markPendingLocalChanges(this.index, (k, r) => this.dirty.mark(k, r));
+    // An entry whose base names no remote head (row S8/C5 integrity case): the resync it scheduled lived
+    // in memory only. Plan it again, so a crash between the integrity error and its resync cannot leave
+    // it unresolved for good (seen with a tombstone purged while the folder was excluded). Only with a
+    // remote mirror (a cursor): before the first snapshot every head is missing by definition.
+    if ((await readMeta(d.state, "cursor")) !== undefined) {
+      for (const e of this.index.all()) {
+        if (e.synced && e.scope === "active" && !this.index.remote.byFileId(e.fileId)) this.dirty.mark({ fileId: e.fileId, path: e.path }, "remote");
+      }
+    }
     if (this.planCtx.mode !== "incremental") {
       // An unfinished snapshot/epoch/rebuild reconcile: its dirty marks died with the process, so every
       // entry is planned again in that mode (rows S8/C5/C6 need it; nothing else changes for a file
@@ -515,6 +537,7 @@ export class ShuttleEngine implements Engine {
         // design §2.9.1: since is null before the first bootstrap (the server answers no-cursor, never
         // epoch: a fresh device has seen no rebuild and must not trip the epoch guard).
         const cursor = (await readMeta(this.deps.state, "cursor")) ?? null;
+        this.neverBootstrapped = cursor === null;
         this.subscribe(cursor);
       }
     } else {
@@ -603,7 +626,16 @@ export class ShuttleEngine implements Engine {
     const before = this.filter.fingerprint();
     this.filter = this.makeFilter();
     if (this.filter.fingerprint() !== before && this.started) {
-      // Persisted by rescope() once the scope change is applied, so a crash before it re-runs it.
+      // The new fingerprint is persisted by rescope() once the scope change is applied. Until then
+      // the stored value must not match any filter: a restart before the rescope re-runs it, also
+      // when the filter went back to the stored one meanwhile (A → B → A). Index changes made under
+      // B (a rename into a folder B includes) still need A's rescope (design §3.11, D6).
+      await writeMeta(this.deps.state, "filterFingerprint", RESCOPE_PENDING).catch(() => undefined);
+      for (const e of [...this.index.all()]) {
+        if (e.scope === "active" || this.filter.scope(e.path, e.obs?.size) !== "active") continue;
+        if (await this.isFileAt(e.path)) this.reincludedPresent.add(e.fileId);
+        else this.reincludedPresent.delete(e.fileId);
+      }
       this.rescopeDue = true;
       this.kick("settings");
     }
@@ -750,27 +782,18 @@ export class ShuttleEngine implements Engine {
         // The vault-info then is exactly the one this device sent: the rebuild is ours, adopt it;
         // otherwise this device would keep committing into an epoch it never resynced (sim 597, 983).
         const now = await r.getVaultInfo().catch(() => null);
-        if (!now || !sameVaultInfo(now.info, next)) throw e;
+        if (!now) {
+          // Outcome unknown (the vault-info read failed too): reconnect. connect() adopts the rebuild
+          // as this device's own if the remote then holds exactly the info sent (sim seed 99).
+          this.unconfirmedRebuild = next;
+          void this.closeRemote().then(() => this.ensureConnected());
+          throw e;
+        }
+        if (!sameVaultInfo(now.info, next)) throw e;
         epoch = next.epoch;
       }
       this.log.add({ cat: "general", key: "log.rebuildRemote", params: { files: pre.files, epoch } });
-      // The new epoch belongs to this device: seen moves forward (rollback reference reset: the old
-      // maxSeq described the history we just replaced), the mirror is replaced by the epoch resync.
-      const seen = this.seenStore.load();
-      this.seenStore.save({
-        epoch: next.epoch, infoRev: next.infoRev, activeKv: Math.max(seen?.activeKv ?? 0, next.activeKv), maxSeq: 0,
-      });
-      this.vaultInfo = next;
-      this.connectInfo = { ...this.connectInfo, epoch: next.epoch };
-      if (this.guardPause === "rollback") {
-        this.guards.clear("rollback");
-        this.guardPause = null;
-      }
-      this.closeSub();
-      this.pendingResync = "epoch";
-      this.ownRebuild = true;
-      this.planCtx = { mode: "epoch" };
-      await writeMeta(this.deps.state, "planCtx", { mode: "epoch" }).catch(() => undefined);
+      await this.adoptOwnRebuild(next);
     } finally {
       this.running = null;
       done();
@@ -778,6 +801,28 @@ export class ShuttleEngine implements Engine {
     this.kick("rebuildRemote");
     this.publishStatus();
     return pre;
+  }
+
+  /**
+   * The new epoch belongs to this device: seen moves forward (rollback reference reset: the old
+   * maxSeq described the history we just replaced), the mirror is replaced by the epoch resync.
+   */
+  private async adoptOwnRebuild(next: VaultInfo): Promise<void> {
+    const seen = this.seenStore.load();
+    this.seenStore.save({
+      epoch: next.epoch, infoRev: next.infoRev, activeKv: Math.max(seen?.activeKv ?? 0, next.activeKv), maxSeq: 0,
+    });
+    this.vaultInfo = next;
+    if (this.connectInfo) this.connectInfo = { ...this.connectInfo, epoch: next.epoch };
+    if (this.guardPause === "rollback") {
+      this.guards.clear("rollback");
+      this.guardPause = null;
+    }
+    this.closeSub();
+    this.pendingResync = "epoch";
+    this.ownRebuild = true;
+    this.planCtx = { mode: "epoch" };
+    await writeMeta(this.deps.state, "planCtx", { mode: "epoch" }).catch(() => undefined);
   }
 
   async repair(fileId: FileId): Promise<void> {
@@ -1085,6 +1130,7 @@ export class ShuttleEngine implements Engine {
       mergeOptions: this.mergeOpts,
       log: this.toLog,
       scheduleResync: () => { this.pendingResync ??= "snapshotResync"; this.kick("integrity"); },
+      connected: () => this.connected,
       afterIndexChange: () => { void this.renames.retry(); },
       allowPushDelete: (fileId, path) => this.allowPushDelete(fileId, path),
     });
@@ -1340,7 +1386,23 @@ export class ShuttleEngine implements Engine {
       return false;
     }
     if (tripped) this.emptyOverride = false;
-    for (const m of marks) this.dirty.mark(m.key, m.reason);
+    // A move caught half-way (delete seen, create not yet): pair it here, never delete + create.
+    const kept = await pairScanRenames(marks, {
+      index: this.index,
+      hashNow: async (p) => {
+        try {
+          return (await readAndHash(this.deps.fs, p)).hash;
+        } catch {
+          return null;
+        }
+      },
+      isDeleteHeld: (p) => this.events.isDeleteHeld(p),
+      rename: async (from, to) => {
+        this.events.releaseDelete(from);
+        await this.renames.rename(from, to);
+      },
+    });
+    for (const m of kept) this.dirty.mark(m.key, m.reason);
     if (mode === "full" || mode === "fast") await writeMeta(this.deps.state, "lastFullScanAt", this.deps.clock.now()).catch(() => undefined);
     return true;
   }
@@ -1444,9 +1506,18 @@ export class ShuttleEngine implements Engine {
 
   private async rescope(): Promise<void> {
     this.rescopeDue = false;
+    const present = this.reincludedPresent;
+    this.reincludedPresent = new Set();
     for (const e of [...this.index.all()]) {
       const sc = this.filter.scope(e.path, e.obs?.size);
       if (sc === e.scope) continue;
+      if (sc === "active" && present.has(e.fileId) && !(await this.isFileAt(e.path))) {
+        // The file was there when the folder came back into scope and is gone now: the user deleted it
+        // in scope (seeds 151, 200: delete between the filter change and the next loop). Row S5.
+        await this.index.setScope(e.fileId, sc);
+        this.dirty.mark({ fileId: e.fileId, path: e.path }, "missing");
+        continue;
+      }
       if (sc === "active" && !(await this.isFileAt(e.path))) {
         // I12 / lead decision D6: re-inclusion never pushes a delete the user did not make in scope. The
         // local copy vanished while out of scope (a remote move into the excluded folder, or a removal
@@ -1553,6 +1624,7 @@ export class ShuttleEngine implements Engine {
     if (this.pendingResync === mode || mode === "rebuild") this.pendingResync = null;
     if (this.connectInfo) await writeMeta(this.deps.state, "remoteEpoch", this.connectInfo.epoch);
     this.conflictCopiesThisPass = 0;
+    this.neverBootstrapped = false;
     this.subscribe(res.cursor);
     return true;
   }
@@ -1582,6 +1654,13 @@ export class ShuttleEngine implements Engine {
       const ci = await r.connect();
       this.connectInfo = ci;
       const got = await r.getVaultInfo();
+      const unconfirmed = this.unconfirmedRebuild;
+      if (got) this.unconfirmedRebuild = null;
+      if (unconfirmed && got && got.info.epoch === ci.epoch && sameVaultInfo(got.info, unconfirmed)) {
+        // A rebuildRemote() whose answer was lost did switch the epoch: it is this device's own.
+        this.log.add({ cat: "general", key: "log.rebuildRemote", params: { files: this.index.activeCount(), epoch: ci.epoch } });
+        await this.adoptOwnRebuild(unconfirmed);
+      }
       if (got) await this.acceptVaultInfo(got.info, ci);
       if (this.tampered) return;
       // design §3.13 rollback: welcome.headSeq < seen.maxSeq in the same epoch.
@@ -1613,6 +1692,7 @@ export class ShuttleEngine implements Engine {
         // design §2.9.1: since is null before the first bootstrap (the server answers no-cursor, never
         // epoch: a fresh device has seen no rebuild and must not trip the epoch guard).
         const cursor = (await readMeta(this.deps.state, "cursor")) ?? null;
+        this.neverBootstrapped = cursor === null;
         this.subscribe(cursor);
       }
       this.kick("connected");
@@ -1803,6 +1883,11 @@ export class ShuttleEngine implements Engine {
       if (typeof info.rollbackAt === "number") this.rollbackAt = info.rollbackAt;
       const seen = this.seenStore.load();
       this.raiseRollback(seen?.maxSeq ?? 0, info.minSeq);
+    } else if (info.reason === "epoch" && this.neverBootstrapped) {
+      // design §2.9.1: a device that never bootstrapped has seen no epoch, so no rebuild happened to
+      // it: whatever the server's reason, this is its first snapshot, never the epoch path (which
+      // would log remoteRebuilt and raise the epoch guard on a fresh join).
+      this.pendingResync = "snapshotResync";
     } else if (info.reason === "epoch") {
       // design §2.11 step 5 / §4.5.3: a new epoch is accepted only through the MAC'd vault-info, and
       // the welcome epoch must equal it. Reconnect (fresh welcome + vault-info check); connect()

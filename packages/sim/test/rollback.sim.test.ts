@@ -3,7 +3,10 @@
 // conflict copy.
 import { describe, expect, it } from "vitest";
 import { backupServer, restoreServer, tokensOf } from "../src/index";
-import { by, checkpoint, scripted } from "./helpers";
+import { by, checkpoint, scripted, guardSim } from "./helpers";
+
+// design §7.2 H3: console output is scanned for each seed's keyring secret.
+guardSim();
 
 describe("I29 server restore", () => {
   it("edits after the backup survive restore + accept", async () => {

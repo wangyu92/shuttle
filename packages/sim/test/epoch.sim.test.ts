@@ -1,7 +1,10 @@
 // I28 epoch safety (S4; design §3.18, §2.11, §7.2): after a rebuild from a filtered device, no other
 // device deletes a local file because it is absent from the new epoch.
 import { describe, expect, it } from "vitest";
-import { by, checkpoint, scripted } from "./helpers";
+import { by, checkpoint, scripted, guardSim } from "./helpers";
+
+// design §7.2 H3: console output is scanned for each seed's keyring secret.
+guardSim();
 
 describe("I28 rebuild from a filtered device", () => {
   it("files outside the rebuilder's scope survive and come back to the remote", async () => {

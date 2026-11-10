@@ -4,6 +4,7 @@
 // rollbackAck hello field (design §2.6.1).
 
 import { describe, expect, it } from "vitest";
+import { isReplaceTemp } from "../src/index";
 import { Node, makeWorld, syncAll } from "./engineHarness";
 
 describe("editorHasOpen → processText (design §3.10.2, S20)", () => {
@@ -25,7 +26,11 @@ describe("editorHasOpen → processText (design §3.10.2, S20)", () => {
     expect(b.fs.readText("n.md")).toBe("one\ntwo\n");
     expect(b.fs.readText("closed.md")).toBe("x\ny\n");
     expect(b.ops("processText")).toEqual(["n.md"]);
-    expect(b.ops("write").slice(writesBefore)).toEqual(["closed.md"]);
+    // D8: the closed note is replaced through a same-folder temp + rename.
+    const writes = b.ops("write").slice(writesBefore);
+    expect(writes.length).toBe(1);
+    expect(isReplaceTemp(writes[0]!)).toBe(true);
+    expect(b.ops("rename")).toContain(writes[0]);
   });
 
   it("without the hook every apply is an atomic write", async () => {

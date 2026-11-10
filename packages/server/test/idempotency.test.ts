@@ -2,7 +2,10 @@
 // restart; same cid + different digest → PROTOCOL; MISSING_BLOB results are re-evaluated on resend.
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { RunningServer } from "../src/server";
-import { TestWs, blobId, cid, fileId, fixture, login, meta, pathKey, putBlob, putOp, removeDir, sealed, start, tempDir, type Client } from "./helpers";
+import { TestWs, blobId, cid, fileId, fixture, login, meta, pathKey, putBlob, putOp, removeDir, sealed, start, tempDir, type Client, guardSuite } from "./helpers";
+
+// design §7.2 H3: logs, admin output and console are scanned for the password and tokens.
+guardSuite();
 
 let srv: RunningServer;
 let dir: string;

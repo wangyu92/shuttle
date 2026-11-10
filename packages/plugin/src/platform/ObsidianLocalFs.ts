@@ -3,16 +3,20 @@
 // - Files Obsidian indexes (everything outside dot folders) go through Vault so its cache, open
 //   editors and other plugins see the change; the configuration folder and other dot paths go
 //   through the DataAdapter, because Vault does not index them.
-// - Writes replace the file in place (Vault.modifyBinary / createBinary, adapter.writeBinary). They
-//   are not crash-atomic: DataAdapter.rename refuses to overwrite an existing file, and the overwrite
-//   behaviour on mobile is unmeasured (P0 M22). The engine's write intents (design §3.8.4) and the
-//   staged merge (lead decision D1) restore a torn write at the next start.
+// - write() replaces the file in place (Vault.modifyBinary / createBinary, adapter.writeBinary). The
+//   engine makes merge writes and pull applies crash-safe itself (lead decision D8): it writes a
+//   `.shuttle-replace-*` temp in the same folder and renames it over the target. rename() from such a
+//   temp replaces an existing file: on desktop through the adapter's node fs (atomic rename(2)); on
+//   mobile DataAdapter.rename refuses to overwrite and the overwrite behaviour is unmeasured (P0 M22),
+//   so the temp's bytes are written over the target in place (residual risk: the pre-D8 torn write,
+//   still covered by write intents, design §3.8.4, and the staged merge, D1).
 // - Paths are NFC towards the engine. A file whose on-disk name is not NFC (Android, Linux) is
 //   remembered under its NFC form so reads and writes reach the real file.
 // - Events are registered when the engine asks (after `workspace.onLayoutReady`, so the load-time
 //   `create` burst never reaches it); the configuration folder is watched through the undocumented
 //   `raw` event (P0 M13).
 
+import { isReplaceTemp } from "@shuttle/engine";
 import type { Disposable, LocalEvent, LocalFs, LocalFsErrorCode, LocalPlatform, LocalStat, RemoveMode } from "@shuttle/protocol";
 
 // ---------- the Obsidian surface used here (structural, so tests can pass a fake) ----------
@@ -36,6 +40,10 @@ export interface AdapterLike {
   rmdir(path: string, recursive: boolean): Promise<void>;
   remove(path: string): Promise<void>;
   rename(from: string, to: string): Promise<void>;
+  /** Desktop FileSystemAdapter: absolute path of a vault path (D8 replace rename). */
+  getFullPath?(path: string): string;
+  /** Desktop FileSystemAdapter: node fs promises (undocumented; D8 replace rename). Absent on mobile. */
+  fsPromises?: { rename(from: string, to: string): Promise<void> };
 }
 
 export interface VaultLike {
@@ -269,6 +277,7 @@ export class ObsidianLocalFs implements LocalFs {
   }
 
   async rename(from: string, to: string): Promise<void> {
+    if (isReplaceTemp(from) && (await this.vault.adapter.exists(this.disk(to)))) return this.replaceWith(from, to);
     const parent = parentOf(to);
     if (parent) await this.mkdirp(parent);
     const f = this.abs(from);
@@ -281,6 +290,39 @@ export class ObsidianLocalFs implements LocalFs {
     const d = this.real.get(from);
     if (d !== undefined) this.real.delete(from);
     this.note(to);
+  }
+
+  /**
+   * Lead decision D8: rename an engine replace temp over an existing file. Desktop: rename(2) through
+   * the adapter's node fs (atomic; Obsidian's watcher reports the change). Mobile has no rename over an
+   * existing file (DataAdapter.rename refuses, P0 M22): the temp's bytes are written over the target in
+   * place, then the temp is removed. That is the pre-D8 exposure (a torn in-place write), the residual
+   * risk; the target is never removed first.
+   */
+  private async replaceWith(tmp: string, to: string): Promise<void> {
+    const a = this.vault.adapter;
+    if (a.fsPromises && a.getFullPath) {
+      try {
+        await a.fsPromises.rename(a.getFullPath(this.disk(tmp)), a.getFullPath(this.disk(to)));
+      } catch (e) {
+        throw wrap(e, tmp);
+      }
+      return;
+    }
+    let bytes: ArrayBuffer;
+    let mtime: number;
+    try {
+      bytes = await a.readBinary(this.disk(tmp));
+      mtime = (await a.stat(this.disk(tmp)))?.mtime ?? Date.now();
+    } catch (e) {
+      throw wrap(e, tmp);
+    }
+    await this.write(to, new Uint8Array(bytes), { mtime });
+    try {
+      await a.remove(this.disk(tmp));
+    } catch {
+      // A leftover temp is ignored by the path filter (dot name); the next write replaces nothing of it.
+    }
   }
 
   async remove(path: string, mode: RemoveMode): Promise<void> {

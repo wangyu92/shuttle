@@ -7,6 +7,10 @@ import type { CommitRequest } from "@shuttle/protocol";
 import { TestIds } from "@shuttle/testkit";
 import { backoffDelay } from "../src/index";
 import { DEV, RecSink, changes, harness, memState, welcome, type Harness } from "./fakes";
+import { guardOutput } from "../../testkit/test/outputGuard";
+
+// design §7.2 H3: console output is scanned for the test device token.
+guardOutput({ name: "device token", value: "sxd_test" });
 
 const ids = new TestIds("feed");
 const req = (): CommitRequest => ({ cid: ids.cid(), ops: [ids.put()] });

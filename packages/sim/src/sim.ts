@@ -15,12 +15,12 @@
 //   I5 blobs before meta (on every commit), I24 budgets, and "no tampered/integrity guard".
 
 import type { FileEntry, Op, VersionRecord } from "@shuttle/protocol";
-import { Prng } from "@shuttle/testkit";
+import { Prng, setMacrotaskHook } from "@shuttle/testkit";
 import { decodeRecord, sha256Hex } from "@shuttle/engine";
 import { SimDevice, isCrashLike, type GuardRecord, type SimDeviceConfig } from "./device";
 import { Evidence, Ledger, noteBytes, noteLines, tokensOf } from "./ledger";
 import { NO_FAULTS, type CommitRecord, type NetFaultRates, type NetViolation } from "./net";
-import { installDeterministicRandom } from "./random";
+import { installDeterministicAsync, installDeterministicRandom } from "./random";
 import { makeSimWorld, type SimWorld } from "./world";
 
 export interface SimOptions {
@@ -96,20 +96,28 @@ const isNote = (p: string): boolean => p.endsWith(".md");
 /** Run one seed. Never throws for engine behavior: failures are returned. */
 export async function runSim(o: SimOptions): Promise<SimResult> {
   const restore = installDeterministicRandom(new Prng(`rand-${o.seed}`));
+  const restoreAsync = installDeterministicAsync(setMacrotaskHook);
   const sim = new Sim(o);
   const onUnhandled = (e: unknown): void => { sim.fail("unhandled", `unhandled rejection: ${errText(e)}`); };
   const proc = (globalThis as unknown as { process?: { on(ev: string, f: (e: unknown) => void): void; off(ev: string, f: (e: unknown) => void): void } }).process;
   proc?.on("unhandledRejection", onUnhandled);
   const t0 = Date.now();
+  let ms = 0;
   try {
     await sim.run();
   } catch (e) {
     sim.fail("crash", `harness or engine threw: ${errText(e)}`);
   } finally {
+    ms = Date.now() - t0;
+    // Background work of this run (feed delivery, in-flight WebCrypto calls) must not run into the
+    // next seed: it would draw from that seed's random stream and break bit-for-bit replay (design
+    // §7.4). Stop every engine, then let the queued work finish before the stream is swapped back.
+    await sim.teardown();
+    await restoreAsync();
     proc?.off("unhandledRejection", onUnhandled);
     restore();
   }
-  return sim.result(Date.now() - t0);
+  return sim.result(ms);
 }
 
 function errText(e: unknown): string {
@@ -174,11 +182,13 @@ export class Sim {
   }
 
   fail(inv: string, detail: string): void {
+    if (this.tornDown) return;
     this.failures.push({ inv, step: this.step, detail });
     if (this.failStep === null) this.failStep = this.step;
   }
 
   private log(entry: Record<string, unknown>): void {
+    if (this.tornDown) return;
     const line = JSON.stringify({ s: this.step, ...entry });
     this.trace.push(line);
     if (this.o.keepTrace) this.detail.push(line);
@@ -221,6 +231,15 @@ export class Sim {
       };
     }
     for (const d of this.devices) await d.start();
+  }
+
+  /** Set once the run is over: background work of the stopped engines no longer counts. */
+  private tornDown = false;
+
+  /** End of run: stop every engine and let their in-flight work drain (see runSim). */
+  async teardown(): Promise<void> {
+    this.tornDown = true;
+    for (const d of this.devices) await d.shutdown();
   }
 
   async run(): Promise<void> {
@@ -308,6 +327,34 @@ export class Sim {
 
   private noteScope(d: SimDevice, path: string): void {
     if (d.scopeOf(path, 0) !== "active") this.deferred.add(path);
+  }
+
+  /**
+   * Oracle rule (lead review needed): a user change made in scope but not yet pushed when the device
+   * excludes its folder stays local while excluded (design v1-design.md line 1425: excluded → `NOOP`
+   * both directions, never push) and is pushed when the folder comes back (line 2036, I12: re-enabling
+   * restores 3-way behaviour, bases kept). That push lands in a later checkpoint window than the
+   * action, so the path is exempt like an out-of-scope action. Unpushed = the disk differs from the
+   * remote head and from what the engine last synced at that path (a remote change the device has not
+   * pulled yet is not exempt).
+   */
+  private async deferUnpushed(d: SimDevice, folder: string): Promise<void> {
+    if (d.dead) return;
+    const under = (p: string): boolean => p.startsWith(folder + "/");
+    const heads = await this.serverHeads();
+    const disk = new Map<string, string>();
+    for (const [p, bytes] of d.fs.files()) if (under(p)) disk.set(p, await sha256Hex(bytes));
+    const paths = new Set<string>([...disk.keys(), ...[...heads.keys()].filter(under)]);
+    for (const p of paths) {
+      const local = disk.get(p) ?? null;
+      const head = heads.get(p)?.hash ?? null;
+      if (local === head) continue;
+      const e = d.engine.index?.byPath(p) ?? null;
+      const synced = e?.synced && e.synced.path === p ? e.synced.hash : null;
+      if (local !== null && local === synced) continue;
+      if (local === null && e === null) continue;
+      this.deferred.add(p);
+    }
   }
 
   private isDeferred(p: string): boolean {
@@ -597,6 +644,7 @@ export class Sim {
         const d = this.dev();
         if (d.dead) return;
         const ex = d.engine.settings.excludedFolders.length ? [] : [PRIVATE];
+        if (ex.length) await this.deferUnpushed(d, PRIVATE);
         d.settings = { ...d.settings, excludedFolders: ex };
         try {
           await d.engine.updateSettings({ excludedFolders: ex });

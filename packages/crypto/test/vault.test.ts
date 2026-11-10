@@ -3,8 +3,12 @@ import { describe, expect, it } from "vitest";
 import { type CachedSecrets, type VaultInfo } from "../src/index.js";
 import { changePassphrase, checkRecordFreshness, createVault, fromCache, markRebuild, rotateKey, unlock } from "../src/vault-info.js";
 import type { SxKeyring } from "../src/keyring.js";
+import { vectorSecrets } from "./helpers.js";
+import { guardOutput } from "./h3.js";
 
 const PASS = "correct horse battery staple";
+// design §7.2 H3: console output is scanned for the passphrases and VMKs.
+guardOutput([...vectorSecrets(), ...[PASS, "a brand new passphrase", "rotated passphrase here"].map((value, i) => ({ name: `passphrase ${i + 1}`, value }))]);
 const kdf = { iter: 310000 }; // the floor, to keep the suite fast
 const h = (kv: number) => ({ fileId: "00112233445566778899aabbccddeeff", kv, kind: "put" as const, base: 1, rc: "note" as const, blobs: [], pathKey: "u-4AmhZQy1GvDCVXociBXw" });
 

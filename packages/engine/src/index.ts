@@ -33,6 +33,7 @@ export * from "./journal/backoff";
 
 export * from "./apply/WriteIntents";
 export * from "./apply/BatchOrderer";
+export * from "./apply/replaceFile";
 export * from "./apply/RemoteApplier";
 
 export * from "./index/FileIndex";

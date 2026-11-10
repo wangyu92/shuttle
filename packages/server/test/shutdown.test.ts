@@ -8,8 +8,11 @@ import { DatabaseSync } from "node:sqlite";
 import { build } from "esbuild";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { readHwm } from "../src/hwm";
-import { TEST_ROOT, TestWs, addUser, blobId, cid, createVault, fileId, login, pathKey, putBlob, putOp, removeDir, sealed, start, tempDir } from "./helpers";
+import { TEST_ROOT, TestWs, addUser, blobId, cid, createVault, fileId, login, pathKey, putBlob, putOp, removeDir, sealed, start, tempDir, guardSuite } from "./helpers";
 import type { RunningServer } from "../src/server";
+
+// design §7.2 H3: logs, admin output and console are scanned for the password and tokens.
+guardSuite();
 
 const BUNDLE = path.join(TEST_ROOT, "bundle", "shuttle-server.mjs");
 

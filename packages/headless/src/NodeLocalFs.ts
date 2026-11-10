@@ -7,6 +7,8 @@
 //   never deleted).
 // - write(): temp file in `tmpDir` (same mount as the vault: rename(2) across bind mounts is EXDEV) →
 //   fsync → utimes(mtime) → mkdirp → rename into place → fsync the parent directory. Crash-atomic.
+// - rename(): refuses an occupied target, except from an engine replace temp (`.shuttle-replace-*`,
+//   lead decision D8): that rename replaces the file at the target atomically.
 // - stat(): lstat; ENOENT/ENOTDIR → null. Symlinks are never followed nor listed.
 // - read(): readFile through one fd; size or mtime changed during the read → TornReadError.
 // - remove(): files are unlinked, then empty parents are removed up to (never including) the root.
@@ -26,6 +28,7 @@ import type { Dirent } from "node:fs";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 import type { Disposable, LocalEvent, LocalFs, LocalFsErrorCode, LocalPlatform, LocalStat, RemoveMode } from "@shuttle/protocol";
+import { REPLACE_TEMP_PREFIX } from "@shuttle/engine";
 import type { Logger } from "./log";
 
 export class LocalFsError extends Error {
@@ -478,7 +481,12 @@ export class NodeLocalFs implements LocalFs {
     if (taken) {
       const s = await fsp.lstat(srcAbs);
       // Same inode = the same entry under another spelling (case/normalization-only rename).
-      if (!(taken.ino === s.ino && taken.dev === s.dev)) throw new PathTakenError(t);
+      // Lead decision D8: a rename from an engine replace temp replaces an existing file atomically
+      // (rename(2) over the target); every other rename refuses an occupied target.
+      const replace = path.posix.basename(f).startsWith(REPLACE_TEMP_PREFIX) && s.isFile() && taken.isFile();
+      if (!(taken.ino === s.ino && taken.dev === s.dev) && !replace) throw new PathTakenError(t);
+      // mirror-remote keeps every file a write replaces; a replace rename is such a write.
+      if (replace && this.keepOverwritten) await this.park(dstAbs, dst, true);
     }
     await fsp.mkdir(path.dirname(dstAbs), { recursive: true });
     await fsp.rename(srcAbs, dstAbs);

@@ -3,8 +3,12 @@
 // live flush then threw outside any handler and the process exited, and the vault row stayed unreadable.
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { MAX_SEQ } from "@shuttle/protocol";
+import { writeHwm } from "../src/hwm";
 import type { RunningServer } from "../src/server";
-import { TestWs, fileId, fixture, pathKey, putOp, removeDir, start, tempDir } from "./helpers";
+import { TestWs, fileId, fixture, pathKey, putOp, removeDir, start, tempDir, guardSuite } from "./helpers";
+
+// design §7.2 H3: logs, admin output and console are scanned for the password and tokens.
+guardSuite();
 
 let dir: string;
 let srv: RunningServer;
@@ -25,24 +29,33 @@ it("a hello with seenMaxSeq above MAX_SEQ is refused and the vault keeps working
 });
 
 it("the seq space ends at MAX_SEQ: commits past it are refused, nothing crashes and the vault stays readable", async () => {
-  const { c, vid } = await fixture(srv, dir, "bob");
-  const m = await TestWs.open(srv);
-  await m.connect(c.token, vid, { since: 0, seenMaxSeq: MAX_SEQ - 1 });
-  m.close();
-  const b = await TestWs.open(srv);
-  await b.connect(c.token, vid, { since: 0 });
-  const r1 = await b.commit([putOp(fileId(), null, pathKey())]);
-  expect(r1.results[0]!.ok).toBe(true);
-  const rid = b.nextRid();
-  b.send({ type: "commit", rid, cid: crypto.randomUUID(), ops: [putOp(fileId(), null, pathKey())] });
-  const f = await b.take((x) => x.rid === rid);
-  expect(f.type).toBe("error");
-  expect((f as { code?: string }).code).toBe("INVALID");
-  // Let the coalesced live flush run, then read the vault again on a new socket.
-  await new Promise((res) => setTimeout(res, 200));
-  b.close();
-  const b2 = await TestWs.open(srv);
-  const { welcome } = await b2.connect(c.token, vid, { since: 0 });
-  expect(welcome.headSeq).toBe(MAX_SEQ);
-  b2.close();
+  // A client value no longer raises the head outside a restore (lead decision D9), so the head is put
+  // near MAX_SEQ the way a restore does it: a high-water mark above the DB head at start.
+  const d = await tempDir("seqbound-hwm");
+  let s2 = await start(d);
+  try {
+    const { c, vid } = await fixture(s2, d, "bob");
+    await s2.close();
+    writeHwm(d, vid, { epoch: 1, headSeq: MAX_SEQ - 1 });
+    s2 = await start(d);
+    const b = await TestWs.open(s2);
+    await b.connect(c.token, vid, { since: 0 });
+    const r1 = await b.commit([putOp(fileId(), null, pathKey())]);
+    expect(r1.results[0]!.ok).toBe(true);
+    const rid = b.nextRid();
+    b.send({ type: "commit", rid, cid: crypto.randomUUID(), ops: [putOp(fileId(), null, pathKey())] });
+    const f = await b.take((x) => x.rid === rid);
+    expect(f.type).toBe("error");
+    expect((f as { code?: string }).code).toBe("INVALID");
+    // Let the coalesced live flush run, then read the vault again on a new socket.
+    await new Promise((res) => setTimeout(res, 200));
+    b.close();
+    const b2 = await TestWs.open(s2);
+    const { welcome } = await b2.connect(c.token, vid, { since: 0 });
+    expect(welcome.headSeq).toBe(MAX_SEQ);
+    b2.close();
+  } finally {
+    await s2.close();
+    await removeDir(d);
+  }
 });

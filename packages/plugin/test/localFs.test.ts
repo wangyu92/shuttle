@@ -135,4 +135,32 @@ describe("ObsidianLocalFs", () => {
     expect(v.text("p.md")).toBe("abcd");
     expect(await fs.processText("absent.md", () => "x")).toBe(false);
   });
+
+  it("D8: a rename from a replace temp over an existing note writes the temp's bytes there (mobile path)", async () => {
+    const { v, fs } = setup();
+    await fs.write("n.md", te.encode("old"), { mtime: 1 });
+    await fs.write(".shuttle-replace-1", te.encode("new!"), { mtime: 2 });
+    await fs.rename(".shuttle-replace-1", "n.md");
+    expect(v.text("n.md")).toBe("new!");
+    expect(await fs.stat(".shuttle-replace-1")).toBe(null);
+  });
+
+  it("D8: desktop renames the temp over the note through the adapter's node fs", async () => {
+    const { v, fs } = setup();
+    await fs.write("n.md", te.encode("old"), { mtime: 1 });
+    await fs.write(".shuttle-replace-2", te.encode("new!"), { mtime: 2 });
+    const calls: string[] = [];
+    const a = v.adapter as unknown as { getFullPath(p: string): string; fsPromises: { rename(x: string, y: string): Promise<void> } };
+    a.getFullPath = (p) => `/vault/${p}`;
+    a.fsPromises = { rename: async (x, y) => { calls.push(`${x}->${y}`); } };
+    await fs.rename(".shuttle-replace-2", "n.md");
+    expect(calls).toEqual(["/vault/.shuttle-replace-2->/vault/n.md"]);
+  });
+
+  it("a plain rename onto an existing file still refuses", async () => {
+    const { fs } = setup();
+    await fs.write("a.md", te.encode("a"), { mtime: 1 });
+    await fs.write("b.md", te.encode("b"), { mtime: 1 });
+    await expect(fs.rename("a.md", "b.md")).rejects.toThrow();
+  });
 });

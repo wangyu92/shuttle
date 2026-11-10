@@ -4,7 +4,10 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { DEFAULT_LIMITS, decodePack, encodePack } from "@shuttle/protocol";
 import type { RunningServer } from "../src/server";
-import { api, blobId, fixture, putBlob, removeDir, sealed, sha256, start, tempDir, type Client } from "./helpers";
+import { api, blobId, fixture, putBlob, removeDir, sealed, sha256, start, tempDir, type Client, guardSuite } from "./helpers";
+
+// design §7.2 H3: logs, admin output and console are scanned for the password and tokens.
+guardSuite();
 
 let srv: RunningServer;
 let dir: string;

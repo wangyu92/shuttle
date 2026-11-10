@@ -1,7 +1,10 @@
 // I17 folder expansion (design §3.18, §7.2): a folder rename of N files is N puts with unchanged
 // blobs and no tombstones; a folder delete is N deletes; no ghosts.
 import { describe, expect, it } from "vitest";
-import { by, checkpoint, scripted } from "./helpers";
+import { by, checkpoint, scripted, guardSim } from "./helpers";
+
+// design §7.2 H3: console output is scanned for each seed's keyring secret.
+guardSim();
 
 describe("I17 folder moves", () => {
   it("move then delete a folder of N files", async () => {

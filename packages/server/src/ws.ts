@@ -155,13 +155,9 @@ export class Conn {
     srv.touchDevice(auth.device.device_id, this.ip, h.client.version);
     srv.hub.claim(this); // one socket per (device, vault): the older one closes 4409
 
-    // design §2.6.1: a device that has seen seqs above the head means a restore that also restored hwm.json.
+    // design §2.6.1 with lead decision D9: a raise from a client value only during a known restore, capped.
     const seen = Math.max(h.seenMaxSeq ?? 0, h.since ?? 0);
-    if (seen > v.head_seq && srv.store.raiseHeadForSeen(v.vault_id, seen)) {
-      srv.cfg.log("hello: device has seen seqs above the head; head raised, rollback rule on");
-      srv.hwm.mark(v.vault_id);
-      v = srv.store.vault(v.vault_id)!;
-    }
+    v = srv.noteSeen(v, seen, "hello").v;
     if (h.rollbackAck !== null && v.rollback_at !== null && h.rollbackAck === v.rollback_at) {
       srv.store.setRollbackAck(v.vault_id, this.deviceId, v.rollback_at, h.since ?? 0);
     }

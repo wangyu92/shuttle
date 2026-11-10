@@ -7,7 +7,11 @@ import { b64u, fromB64u } from "../src/b64u.js";
 import { toHex } from "../src/bytes.js";
 import { BLOB_OVERHEAD, MAX_BLOB_SIZE } from "../src/envelope.js";
 import { padIso, padme, unpadIso } from "../src/pad.js";
-import { V, vectorRing } from "./helpers.js";
+import { V, vectorRing, vectorSecrets } from "./helpers.js";
+import { guardOutput } from "./h3.js";
+
+// design §7.2 H3: console output is scanned for the passphrases and VMKs.
+guardOutput(vectorSecrets());
 
 const CHUNK_MAX = 4194304;
 const hexN = (n: number) => fc.uint8Array({ minLength: n, maxLength: n }).map(toHex);

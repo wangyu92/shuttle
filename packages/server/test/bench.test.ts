@@ -9,7 +9,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { CommitOp, CommitResultMsg } from "@shuttle/protocol";
 import { DEFAULT_RATES } from "../src/config";
 import type { RunningServer } from "../src/server";
-import { TestWs, api, cid, fileId, fixture, login, pathKey, putOp, removeDir, start, tempDir, type Client } from "./helpers";
+import { TestWs, api, cid, fileId, fixture, login, pathKey, putOp, removeDir, start, tempDir, type Client, guardSuite } from "./helpers";
+
+// design §7.2 H3: logs, admin output and console are scanned for the password and tokens.
+guardSuite();
 
 const ENABLED = process.env.SHUTTLE_BENCH === "1";
 

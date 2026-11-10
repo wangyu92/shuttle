@@ -34,6 +34,7 @@ import type { DirtyKey, DirtyReason } from "../types";
 import { toHex, utf8DecodeStrict } from "../util/bytes";
 import type { KeyedMutex } from "../util/KeyedMutex";
 import { cryptoRandomBytes, type RandomBytes } from "../util/uuid";
+import { replaceFile } from "./replaceFile";
 import { orderApplies, swapPath, type OrderItem } from "./BatchOrderer";
 import { isStrictPrefix, type WriteIntents } from "./WriteIntents";
 
@@ -281,7 +282,7 @@ export class RemoteApplier {
       // D1 + I6: the torn write was a merge whose staged op was archived (CONFLICT): restore the merged
       // bytes, then the Planner merges them with the current head like any local change.
       d.echo.expect(path, { hash: await sha256Hex(archived), size: archived.length });
-      await d.fs.write(path, archived, { mtime: d.now() });
+      await replaceFile(d.fs, path, archived, { mtime: d.now() });
       await d.intents.delete(path);
       this.tornAttempts.delete(fileId);
       d.log?.({ key: "log.tornMergeRestored", cat: "merge", path, fileId });
@@ -447,7 +448,9 @@ export class RemoteApplier {
     }
     if (!R.deleted && this.heldByOther(targetPath, fileId, opts.replaces)) {
       const h = this.holderOf(targetPath, fileId, opts.replaces);
-      if (h) d.markDirty({ fileId: h.fileId, path: h.path }, "remote");
+      // A holder with a pending op (e.g. its delete waiting for a commit retry) resolves when that op
+      // is acked; re-planning it every iteration only spins the loop and keeps fake time from moving.
+      if (h && !(await this.hasPendingOp(h.fileId))) d.markDirty({ fileId: h.fileId, path: h.path }, "remote");
       await this.bump(fileId, "path held by another entry");
       return "blocked";
     }
@@ -523,7 +526,7 @@ export class RemoteApplier {
         const w: { mtime: number; ctime?: number } = { mtime: R.mtime };
         if (R.ctime !== undefined) w.ctime = R.ctime;
         try {
-          written = await d.fs.write(localPath, bytes, w);
+          written = await replaceFile(d.fs, localPath, bytes, w);
         } catch (err) {
           // A write torn in this session (the file holds a strict prefix of the bytes, D5) is
           // rewritten once right away: left torn, a user delete or edit of the prefix before the
@@ -532,7 +535,7 @@ export class RemoteApplier {
           // Unreadable right now: rewrite only a file that did not exist before (nothing to lose).
           const cur = await d.fs.read(localPath).catch(() => null);
           if (cur ? !isStrictPrefix(cur, bytes) : obs !== null) throw err;
-          written = await d.fs.write(localPath, bytes, w);
+          written = await replaceFile(d.fs, localPath, bytes, w);
         }
       }
       await this.crash("apply:written");
@@ -619,7 +622,17 @@ export class RemoteApplier {
       if (cur) {
         // Local content that is not ours belongs to a new file now: its pending op must not move with it.
         if (obs && !ours) await cancelOpIn(w.tx, fileId);
-        await w.putEntry({ ...cur, path: R.path, foldKey: foldKey(R.path), scope: sc, obs: null, updatedAt: d.now() });
+        // Another entry may already hold the target path (the scan tracks untracked files in the
+        // excluded folder by their scope flag). A placeholder without a base carries nothing: it gives
+        // way. A real tracked entry there keeps the path: ours is dropped instead (the head stays
+        // deferred and comes back on re-inclusion); moving onto it would violate the unique path and
+        // kill every restart (sim seed 192).
+        const holder = w.entryByPath(R.path);
+        if (holder && holder.fileId !== fileId && holder.synced) await w.deleteEntry(fileId);
+        else {
+          if (holder && holder.fileId !== fileId) await w.deleteEntry(holder.fileId);
+          await w.putEntry({ ...cur, path: R.path, foldKey: foldKey(R.path), scope: sc, obs: null, updatedAt: d.now() });
+        }
       }
       await w.tx.deferred.put({ fileId, seq: R.seq, reason: "scope", path: R.path, deferredAt: d.now() });
       const q = await w.tx.applyQueue.get(fileId);
@@ -651,7 +664,11 @@ export class RemoteApplier {
     // Follow only a move the remote made (R.path differs from the synced path): a file the user moved
     // into the excluded folder here stays where the user put it.
     const remoteMoved = e.synced !== null && R.path !== e.synced.path;
-    if (obs && remoteMoved && this.isOurs(e, obs.L.hash, R) && !(await this.hasPendingOp(fileId))) return false;
+    // A local rename into the folder that was never pushed (e.path is not the synced path) is the
+    // user's placement: the normal apply would see it as a local change and hand it to the Planner,
+    // which never acts on an out-of-scope entry. Detach instead (both copies survive, I6/I12).
+    const movedHere = e.synced !== null && e.path !== e.synced.path;
+    if (obs && remoteMoved && !movedHere && this.isOurs(e, obs.L.hash, R) && !(await this.hasPendingOp(fileId))) return false;
     await d.index.write(["journal", "staging", "intents"], async (w) => {
       const cur = w.entry(fileId);
       if (!cur) return;
@@ -783,9 +800,16 @@ export class RemoteApplier {
   }
 
   private async bump(fileId: FileId, error: string): Promise<number> {
+    const R = this.d.index.remote.byFileId(fileId);
     const n = await this.d.state.tx(["applyQueue"], async (tx) => {
       const q = await tx.applyQueue.get(fileId);
-      if (!q) return 0;
+      if (!q) {
+        // A planned apply (Planner PULL) has no queue row: without one the failed apply would never
+        // run again (nothing marks the entry dirty), and the device would report synced (§3.7 liveness).
+        if (!R) return 0;
+        await tx.applyQueue.put({ fileId, seq: R.seq, enqueuedAt: this.d.now(), attempts: 1, lastError: error });
+        return 1;
+      }
       const attempts = q.attempts + 1;
       await tx.applyQueue.put({ ...q, attempts, lastError: error });
       return attempts;

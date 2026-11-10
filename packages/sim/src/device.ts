@@ -178,6 +178,13 @@ export class SimDevice {
     if (o.run !== false) await this.iterate();
   }
 
+  /** End of a sim run: the process goes away for good (no restart follows). */
+  async shutdown(): Promise<void> {
+    if (!this.engine) return;
+    this.kill();
+    await this.engine.stop().catch(() => undefined);
+  }
+
   /** Arm a crash `k` crash points from now. */
   armCrash(k: number): void {
     this.crashAt = this.points + Math.max(1, k);

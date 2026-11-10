@@ -2,8 +2,11 @@
 // the CORRECT outcome now that the engine is fixed (lead decisions D5 and D6, 클로드 제안(미승인)).
 import { describe, expect, it } from "vitest";
 import { noteBytes, noteLines } from "../src/index";
-import { by, checkpoint, scripted, text } from "./helpers";
+import { by, checkpoint, scripted, text, guardSim } from "./helpers";
 import type { Sim } from "../src/index";
+
+// design §7.2 H3: console output is scanned for each seed's keyring secret.
+guardSim();
 
 /** Quiesce and run the oracles without failing the test; the invariant ids that fired. */
 async function oracles(sim: Sim): Promise<string[]> {

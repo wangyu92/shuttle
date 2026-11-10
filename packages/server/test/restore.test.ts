@@ -1,12 +1,16 @@
 // I29 server side: restoring an older shuttle.db (design §2.6.1, §2.6.6). With a newer hwm.json the
-// head is raised on start; when hwm.json was restored too, hello.seenMaxSeq raises it.
+// head is raised on start; when hwm.json was restored too, the server cannot tell (lead decision D9)
+// and the device's own check (welcome.headSeq < seen.maxSeq) catches it.
 import { copyFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { runAdmin } from "../src/adminCli";
 import { readHwm } from "../src/hwm";
 import type { RunningServer } from "../src/server";
-import { TestWs, fileId, fixture, pathKey, putOp, removeDir, silentIo, start, tempDir, type Client } from "./helpers";
+import { TestWs, fileId, fixture, pathKey, putOp, removeDir, silentIo, start, tempDir, type Client, guardSuite } from "./helpers";
+
+// design §7.2 H3: logs, admin output and console are scanned for the password and tokens.
+guardSuite();
 
 let srv: RunningServer | null = null;
 let dir: string | undefined;
@@ -75,7 +79,11 @@ describe("restore (I29)", () => {
     ws.close();
   }, 30_000);
 
-  it("DB and hwm.json both restored → hello.seenMaxSeq raises the head and starts the rule", async () => {
+  // Lead decision D9 overrides design §2.6.1 ("hello.seenMaxSeq above the head raises it") and the §7
+  // test line "restore both → seenMaxSeq path": with no restore known to the server, a client value is
+  // logged and ignored. The device itself detects the rollback from welcome.headSeq < seen.maxSeq
+  // (design §3.13, §4.9.2) and pauses with RemoteRolledBack.
+  it("DB and hwm.json both restored → hello.seenMaxSeq is not trusted (D9); welcome shows the lower head", async () => {
     dir = await tempDir("restore2");
     srv = await start(dir);
     const { c, vid } = await fixture(srv, dir);
@@ -91,10 +99,10 @@ describe("restore (I29)", () => {
     srv = await start(dir);
     const ws = await TestWs.open(srv);
     ws.hello(c.token, vid, { since: 7, seenMaxSeq: 7 });
-    await ws.type("welcome");
-    expect(await ws.type("snapshotRequired")).toMatchObject({ reason: "rollback" });
+    expect((await ws.type("welcome")).headSeq).toBe(3);
+    expect(ws.frames.find((f) => f.type === "snapshotRequired")).toBeUndefined();
     const snap = await fetch(`${srv.url}/v1/vaults/${vid}/snapshot`, { headers: c.auth }).then((r) => r.json());
-    expect(snap.headSeq).toBe(7);
+    expect(snap.headSeq).toBe(3);
     ws.close();
   });
 

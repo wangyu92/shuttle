@@ -12,7 +12,11 @@ import { metaPadLen, padme, padmeTarget } from "../src/pad.js";
 import { selfTest, vectorPassphrase, vectorVaultInfo } from "../src/selftest.js";
 import { sha256 } from "../src/suite-sx1.js";
 import { unlock, unlockWithKdfFloor } from "../src/vault-info.js";
-import { V, vectorRing, withNonces } from "./helpers.js";
+import { V, vectorRing, withNonces, vectorSecrets } from "./helpers.js";
+import { guardOutput } from "./h3.js";
+
+// design §7.2 H3: console output is scanned for the passphrases and VMKs.
+guardOutput(vectorSecrets());
 
 const vid = V.inputs.vaultId;
 const kdf1000: Kdf = { alg: "PBKDF2-SHA256", iter: 1000, salt: b64u(fromHex(V.inputs.saltHex)) };

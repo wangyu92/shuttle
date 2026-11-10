@@ -1,7 +1,10 @@
 // I24 memory budget (design §3.18, §3.15, §7.2): in-flight blob bytes never exceed the platform
 // budget except one admitted item <= maxFileBytes; upload/download concurrency stays at the cap.
 import { describe, expect, it } from "vitest";
-import { by, checkpoint, scripted } from "./helpers";
+import { by, checkpoint, scripted, guardSim } from "./helpers";
+
+// design §7.2 H3: console output is scanned for each seed's keyring secret.
+guardSim();
 
 describe("I24 budgets", () => {
   it("tiny caps: many multi-chunk files upload and download inside the budget", async () => {

@@ -16,6 +16,10 @@ import {
   isB64u16, isBlobId, isFileId, WIRE_ERRORS, WIRE_ERROR_CODES, remoteErrorFromWire, RemoteError, DEFAULT_LIMITS,
   canon, opsDigestPreimage,
 } from "./src/index";
+import { guardOutput } from "./test/h3";
+
+// design §7.2 H3: console output is scanned for the fixture token and password.
+guardOutput([{ name: "fixture token", value: F.TOKEN }, { name: "fixture password", value: F.login.password }]);
 
 type Mut = (o: any) => void;
 const set = (path: string, value: unknown): Mut => (o) => {

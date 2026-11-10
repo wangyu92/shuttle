@@ -3,6 +3,7 @@
 export const PACKAGE_NAME = "@shuttle/testkit";
 
 export { Prng } from "./prng";
+export { type MacrotaskHook, macrotask, setMacrotaskHook } from "./macrotask";
 export { FAKE_EPOCH, FakeClock, type FakeClockOptions, FakeScheduler, drainMicrotasks } from "./clock";
 export {
   type CommitFault, type CommitInfo, MemStateData, MemStateStore, type MemStateStoreOptions, compareKeys,

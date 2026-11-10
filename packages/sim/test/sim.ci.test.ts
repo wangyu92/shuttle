@@ -3,6 +3,10 @@
 // folders). The switches that kept findings A and B out of this set are gone with the fixes (D5, D6).
 import { describe, expect, it } from "vitest";
 import { replayCommand, runSim, type SimOptions } from "../src/index";
+import { guardSim } from "./helpers";
+
+// design §7.2 H3: console output is scanned for each seed's keyring secret.
+guardSim(...Array.from({ length: 20 }, (_, i) => i + 1));
 
 const CI: Omit<SimOptions, 'seed'> = { devices: 3, steps: 100, checkEvery: 50 };
 

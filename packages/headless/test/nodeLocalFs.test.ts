@@ -135,6 +135,19 @@ describe("NodeLocalFs", () => {
     expect(await fs.stat("a.md")).toBeNull();
   });
 
+  it("D8: a rename from an engine replace temp replaces an existing file atomically", async () => {
+    const fs = new NodeLocalFs({ root: vault, tmpDir: tmp });
+    await fs.write("n.md", enc.encode("old"), { mtime: 1000 });
+    await fs.write(".shuttle-replace-1", enc.encode("new!"), { mtime: 2000 });
+    await fs.rename(".shuttle-replace-1", "n.md");
+    expect(dec.decode(await fs.read("n.md"))).toBe("new!");
+    expect(await fs.stat(".shuttle-replace-1")).toBeNull();
+    // A replace temp never replaces a folder.
+    await fs.write("d/x.md", enc.encode("x"), { mtime: 1000 });
+    await fs.write(".shuttle-replace-2", enc.encode("t"), { mtime: 1000 });
+    await expect(fs.rename(".shuttle-replace-2", "d")).rejects.toSatisfy((e: unknown) => hasFsCode(e, "EEXIST"));
+  });
+
   it("remove unlinks files and prunes empty parents up to, never including, the root; folders are parked", async () => {
     const fs = new NodeLocalFs({ root: vault, tmpDir: tmp });
     await fs.write("p/q/r.md", enc.encode("r"), { mtime: 1000 });

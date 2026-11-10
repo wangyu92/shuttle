@@ -7,7 +7,7 @@ import {
   CHANGES_LIMIT_DEFAULT, CHANGES_WAIT_MAX_SEC, ENROLL_CODE_TTL_SEC, ENROLL_URI_ACTION, HEADER_CONFIRM, HEADER_REQUEST_ID,
   HEADER_SERVER, HEADER_SHA256, LIVE_MAX_BYTES, PACK_CONTENT_TYPE, PAIRING_TTL_SEC, PackError, SNAPSHOT_PAGE_DEFAULT,
   SNAPSHOT_PAGE_MAX, SUPPORTED_PROTOCOLS, checkCommitLimits, decodePack, encodePack, isBlobId, isDeviceId, isFileId,
-  isPairId, isSha256Hex, isVaultId, validateAckRequest, validateCommitRequest, validateCreateVaultRequest,
+  isPairId, isSeq, isSha256Hex, isVaultId, validateAckRequest, validateCommitRequest, validateCreateVaultRequest,
   validateEnrollCodeRequest, validateEnrollRequest, validateLoginRequest, validateMissingBlobsRequest,
   validatePackGetRequest, validatePairingBody, validateRebuildRequest, validateRenameDeviceRequest,
   validateVaultInfoEnvelope,
@@ -545,6 +545,18 @@ function snapshot(srv: Server, c: Ctx, v: VaultRow): void {
   sendJson(c.res, 200, body);
 }
 
+/**
+ * An optional seq query parameter: absent or empty → null; anything but a plain decimal safe integer
+ * in [0, MAX_SEQ] → INVALID (lead decision D9: no state change from a value that is not a seq).
+ */
+function seqParam(url: URL, name: string): number | null {
+  const text = url.searchParams.get(name);
+  if (text === null || text === "") return null;
+  const n = /^[0-9]{1,16}$/.test(text) ? Number(text) : NaN;
+  if (!isSeq(n)) throw new HttpError("INVALID", `bad ${name}`);
+  return n;
+}
+
 function snapshotRequired(v: VaultRow, reason: SnapshotReason): HttpError {
   return new HttpError("SNAPSHOT_REQUIRED", `snapshot required (${reason})`, {
     details: { minSeq: v.min_seq, epoch: v.epoch, reason, rollbackAt: reason === "rollback" ? v.rollback_at : null },
@@ -553,16 +565,20 @@ function snapshotRequired(v: VaultRow, reason: SnapshotReason): HttpError {
 
 async function changes(srv: Server, c: Ctx, au: Authed, v: VaultRow): Promise<void> {
   if (c.method !== "GET") methodNotAllowed();
-  const sinceText = c.url.searchParams.get("since");
-  const since = Number(sinceText);
-  if (sinceText === null || sinceText === "" || !Number.isSafeInteger(since) || since < 0) throw new HttpError("INVALID", "bad since");
+  const since = seqParam(c.url, "since");
+  if (since === null) throw new HttpError("INVALID", "bad since");
+  // design §2.6.1 + lead decision D9: same rule as the WS hello, on max(since, seenMaxSeq).
+  const seenMaxSeq = seqParam(c.url, "seenMaxSeq");
+  const seen = Math.max(since, seenMaxSeq ?? 0);
   const limit = intParam(c.url, "limit", CHANGES_LIMIT_DEFAULT, 1, CHANGES_LIMIT_DEFAULT);
   const wait = intParam(c.url, "wait", 0, 0, CHANGES_WAIT_MAX_SEC);
   const epochText = c.url.searchParams.get("epoch");
   const ackText = c.url.searchParams.get("rollbackAck");
   if (epochText !== null && Number(epochText) !== v.epoch) throw snapshotRequired(v, "epoch");
+  v = srv.noteSeen(v, seen, "changes").v;
   if (since < v.min_seq) throw snapshotRequired(v, "cursor-too-old");
-  if (v.rollback_at !== null && v.restored_seq !== null && since > v.restored_seq) {
+  // `seen` also covers a device whose own acked commit above restored_seq never reached its cursor.
+  if (v.rollback_at !== null && v.restored_seq !== null && seen > v.restored_seq) {
     if (ackText !== null && Number(ackText) === v.rollback_at) srv.store.setRollbackAck(v.vault_id, au.device.device_id, v.rollback_at, since);
     else if (srv.store.rollbackAckOf(v.vault_id, au.device.device_id) !== v.rollback_at) throw snapshotRequired(v, "rollback");
   }

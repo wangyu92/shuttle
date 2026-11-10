@@ -28,9 +28,9 @@ import type {
   WelcomeLimits,
 } from "@shuttle/protocol";
 import { FakeClock } from "./clock";
+import { macrotask } from "./macrotask";
 import { Prng } from "./prng";
 
-const realSetTimeout: typeof setTimeout = globalThis.setTimeout.bind(globalThis);
 const clone = <T>(v: T): T => structuredClone(v);
 
 export type FakeMethod = Exclude<keyof RemoteAdapter, 'kind' | 'capabilities'>;
@@ -195,10 +195,10 @@ export class FakeRemoteServer {
   /** @internal Sink callbacks never run inside the adapter call that caused them; settle() waits for them. */
   later(fn: () => void): void {
     this.pendingNotes++;
-    realSetTimeout(() => {
+    macrotask(() => {
       this.pendingNotes--;
       fn();
-    }, 0);
+    });
   }
 
   /** Stop / restart pushing batches (subscriptions stay open). */
@@ -217,7 +217,7 @@ export class FakeRemoteServer {
       const running = [...this.subs].filter((s) => s.running);
       if (busy.length === 0 && running.length === 0 && this.pendingNotes === 0) return;
       for (const s of busy) void s.pump();
-      await new Promise((r) => { realSetTimeout(r, 0); });
+      await new Promise<void>((r) => { macrotask(() => r()); });
     }
     throw new Error("FakeRemoteServer.deliver: did not settle");
   }
@@ -695,7 +695,7 @@ class FakeSubscription implements Subscription {
   schedule(): void {
     if (this.scheduled || this.running || !this.srv.autoDeliver || this.srv.feedPaused) return;
     this.scheduled = true;
-    realSetTimeout(() => { this.scheduled = false; void this.pump(); }, 0);
+    macrotask(() => { this.scheduled = false; void this.pump(); });
   }
 
   pushLive(records: VersionRecord[]): void {

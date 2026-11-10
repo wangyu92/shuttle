@@ -1,7 +1,10 @@
 // I20 rebuild equivalence (design §3.18, §7.2): wiping the StateStore on a quiescent synced device
 // gives 0 uploads, 0 downloads, 0 conflict copies (+ the pendingOps replay of S26).
 import { describe, expect, it } from "vitest";
-import { by, checkpoint, commitsOf, scripted, text } from "./helpers";
+import { by, checkpoint, commitsOf, scripted, text, guardSim } from "./helpers";
+
+// design §7.2 H3: console output is scanned for each seed's keyring secret.
+guardSim();
 
 const blobReads = (sim: Awaited<ReturnType<typeof scripted>>, id: string): number =>
   sim.w.server.calls.filter((c) => c.device === id && (c.method === "getBlob" || c.method === "getBlobs")).length;

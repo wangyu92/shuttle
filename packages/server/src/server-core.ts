@@ -2,13 +2,13 @@
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { CloseCode } from "@shuttle/protocol";
+import { CloseCode, MAX_SEQ } from "@shuttle/protocol";
 import type { CommitRequest, VaultInfoEnvelope, VersionRecord } from "@shuttle/protocol";
 import { FailureLimiter, TokenBuckets, newDeviceToken, tokenHash } from "./auth";
 import { BlobStore } from "./blobs";
 import type { ResolvedConfig } from "./config";
 import { Stmts, openDb, txImmediate } from "./db";
-import { HwmWriter, reconcileHwm } from "./hwm";
+import { HwmWriter, readHwm, reconcileHwm } from "./hwm";
 import { Store, type CommitOutcome, type VaultRow } from "./store";
 import { HttpError, MINUTE_MS, randomId16, sha256Hex } from "./util";
 import { Hub } from "./ws";
@@ -24,6 +24,11 @@ export interface DeviceRow {
 export interface UserRow { user_id: string; username: string; pw_hash: string | null; role: "owner" | "member"; created_at: number }
 
 export type AuthResult = { ok: true; device: DeviceRow; user: UserRow } | { ok: false; code: "UNAUTHENTICATED" | "REVOKED" };
+
+/** Largest raise of head_seq one client report can cause outside a high-water mark (lead decision D9). */
+export const SEEN_RAISE_MAX = 1_000_000;
+
+export type SeenOutcome = "none" | "raised" | "ignored";
 
 export function etagOf(infoJson: string): string {
   return `"${sha256Hex(infoJson).slice(0, 16)}"`;
@@ -66,6 +71,38 @@ export class Server {
     for (const r of reconcileHwm(this.s, d, cfg.now())) {
       cfg.log(`restore detected: vault head raised ${r.from} -> ${r.to} from hwm.json; rollback rule on`);
     }
+  }
+
+  // ---------------- client-reported seqs ----------------
+
+  /**
+   * A device reports the highest seq it has seen (hello `max(since, seenMaxSeq)`, or REST GET /changes
+   * `max(since, seenMaxSeq)`). design §2.6.1 raises head_seq to it so no seq is reused after a restore.
+   * Lead decision D9 limits how far a client value is trusted (it is not authenticated data):
+   *   - the value is already a safe integer <= MAX_SEQ (validators reject anything else, no state change);
+   *   - a raise is honoured only while a restore is known: rollback_at is set, or hwm.json holds a mark
+   *     above the DB head;
+   *   - it is capped at max(hwm mark, head_seq + SEEN_RAISE_MAX), and never past MAX_SEQ;
+   *   - outside a restore the value is logged and ignored. The device itself still sees
+   *     welcome.headSeq < seen.maxSeq and raises RemoteRolledBack (design §3.13, §4.9.2).
+   * Returns the vault row to use from here on.
+   */
+  noteSeen(v: VaultRow, seen: number, via: "hello" | "changes"): { v: VaultRow; outcome: SeenOutcome } {
+    if (!Number.isSafeInteger(seen) || seen < 0 || seen > MAX_SEQ) throw new HttpError("INVALID", "bad seq");
+    if (seen <= v.head_seq) return { v, outcome: "none" };
+    const mark = readHwm(this.cfg.dataDir, v.vault_id);
+    const markAbove = mark !== null && mark.headSeq > v.head_seq;
+    if (v.rollback_at === null && !markAbove) {
+      // Never echo the value or ids beyond the gap size: logs stay small and free of client data.
+      this.cfg.log(`${via}: a device reported seqs ${seen - v.head_seq} above the head outside a restore; ignored`);
+      return { v, outcome: "ignored" };
+    }
+    const cap = Math.min(MAX_SEQ, Math.max(mark?.headSeq ?? 0, v.head_seq + SEEN_RAISE_MAX));
+    const to = Math.min(seen, cap);
+    if (to <= v.head_seq || !this.store.raiseHeadForSeen(v.vault_id, to)) return { v, outcome: "none" };
+    this.cfg.log(`${via}: device has seen seqs above the head during a restore; head raised by ${to - v.head_seq}${to < seen ? " (capped)" : ""}`);
+    this.hwm.mark(v.vault_id);
+    return { v: this.store.vault(v.vault_id) ?? v, outcome: "raised" };
   }
 
   // ---------------- auth ----------------

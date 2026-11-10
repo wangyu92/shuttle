@@ -18,6 +18,7 @@ import type { FileId, LocalFs, LocalStat, StateStore, WriteIntent } from "@shutt
 import { readAndHash, sha256Hex } from "../content/hash";
 import { dirname } from "../path/normalize";
 import { hasFsCode } from "../platform/LocalFs";
+import { replaceFile } from "./replaceFile";
 
 export interface WriteIntentsDeps {
   state: StateStore;
@@ -134,7 +135,7 @@ export class WriteIntents {
     }
     onWrite?.(staged, intent.targetHash as string);
     await this.d.fs.mkdirp(dirname(path)).catch(() => undefined);
-    await this.d.fs.write(path, staged, { mtime: this.d.now ? this.d.now() : 0 });
+    await replaceFile(this.d.fs, path, staged, { mtime: this.d.now ? this.d.now() : 0 });
     await this.delete(path);
     return "restored";
   }

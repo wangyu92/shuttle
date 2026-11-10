@@ -5,7 +5,10 @@ import { assertNoSecrets } from "@shuttle/testkit";
 import { normalizeEnrollCode } from "../src/auth";
 import { parseTtl, runAdmin } from "../src/adminCli";
 import type { RunningServer } from "../src/server";
-import { FakeTime, PASSWORD, TestWs, addUser, api, fixture, login, removeDir, silentIo, start, tempDir, type Client } from "./helpers";
+import { FakeTime, PASSWORD, TestWs, addUser, api, fixture, login, removeDir, silentIo, start, tempDir, type Client, guardSuite } from "./helpers";
+
+// design §7.2 H3: logs, admin output and console are scanned for the password and tokens.
+guardSuite();
 
 let srv: RunningServer;
 let dir: string;

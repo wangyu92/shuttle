@@ -3,6 +3,10 @@
 // responses, duplicates, 5xx) make the blob/commit ordering interesting.
 import { describe, expect, it } from "vitest";
 import { runSim } from "../src/index";
+import { guardSim } from "./helpers";
+
+// design §7.2 H3: console output is scanned for each seed's keyring secret.
+guardSim(11, 12, 13);
 
 describe("I5 blobs before meta", () => {
   it("binary-heavy runs under heavy network faults", async () => {

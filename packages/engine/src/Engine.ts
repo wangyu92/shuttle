@@ -204,6 +204,14 @@ class MemSeenStore implements SeenStore {
  */
 export const DELETE_BURST_GRACE_MS = 60_000;
 
+/**
+ * design §3.13 massDeleteLocal across loops: deletes pushed without an approval stay counted against
+ * the threshold for this long, so a mass delete that reaches the engine in several loops (a watcher
+ * that reports an `rm -r` in pieces) still trips the guard. Deletes already pushed are not recalled;
+ * the guard holds the rest. Approved deletes and remote tombstones are not counted. 클로드 제안(미승인), D12.
+ */
+export const DELETE_WINDOW_MS = 60_000;
+
 /** meta.filterFingerprint while a filter change waits for its rescope (never a real fingerprint). */
 const RESCOPE_PENDING = "rescope-pending";
 
@@ -310,7 +318,13 @@ export class ShuttleEngine implements Engine {
   private guardedDeletes = new Set<FileId>();
   /** Tombstones (fileId:seq) the sender's user approved; the receiver does not ask again. */
   private approvedRemoteDeletes = new Set<string>();
-  private deletesThisIteration = 0;
+  /** Deletes pushed without an approval, fileId → monotonic push time; counted for DELETE_WINDOW_MS (D12). */
+  private recentDeletes = new Map<FileId, number>();
+  /**
+   * Window count when the guard parked deletes: while they wait for an answer the burst keeps this
+   * size even after the window ages out, so a later resume asks again instead of pushing them (D12).
+   */
+  private parkedWindowBase = 0;
   private deleteThreshold = 25;
   private conflictCopiesThisPass = 0;
   private conflictApproved = false;
@@ -690,6 +704,9 @@ export class ShuttleEngine implements Engine {
         if (c === "apply") {
           for (const [id2, key] of this.parkedDeletes) { this.approvedDeletes.add(id2); this.dirty.mark(key, "retry"); }
           this.parkedDeletes.clear();
+          // The answer also covers the part of the burst pushed before the guard tripped (D12).
+          this.recentDeletes.clear();
+          this.parkedWindowBase = 0;
           this.deleteBurstUntil = this.deps.clock.now() + DELETE_BURST_GRACE_MS;
           unpause();
         } else this.pause();
@@ -1243,7 +1260,6 @@ export class ShuttleEngine implements Engine {
     }
     res.ran = true;
     this.iterationPushOnly = pushOnly;
-    this.deletesThisIteration = 0;
     this.deleteThreshold = massDeleteThreshold(this.index.activeCount());
     try {
       if (this.connected && this.torn.length > 0) {
@@ -1442,8 +1458,18 @@ export class ShuttleEngine implements Engine {
     return this.deps.clock.now() < this.deleteBurstUntil;
   }
 
+  /** Unapproved deletes pushed within DELETE_WINDOW_MS (D12), never less than the parked burst's base. */
+  private windowDeletes(): number {
+    // Monotonic: a wall-clock jump must neither expire the window early nor keep it forever.
+    const cutoff = this.deps.clock.monotonic() - DELETE_WINDOW_MS;
+    for (const [fid, t] of this.recentDeletes) if (t <= cutoff) this.recentDeletes.delete(fid);
+    const n = this.recentDeletes.size;
+    return this.parkedDeletes.size > 0 ? Math.max(n, this.parkedWindowBase) : n;
+  }
+
   private async precountDeletes(): Promise<boolean> {
-    if (this.dirty.size <= this.deleteThreshold && this.parkedDeletes.size === 0) return true;
+    const pushed = this.windowDeletes();
+    if (this.dirty.size + pushed <= this.deleteThreshold && this.parkedDeletes.size === 0) return true;
     // The user already answered "apply" for this burst (design §3.13 / §7.7: one answer per burst).
     if (this.inDeleteBurst() && this.parkedDeletes.size === 0) return true;
     const mode = this.effectiveMode();
@@ -1459,13 +1485,16 @@ export class ShuttleEngine implements Engine {
       cands.push({ fileId: e.fileId, key: item.key, path: e.path });
     }
     for (const [fid, key] of this.parkedDeletes) if (!cands.some((c) => c.fileId === fid)) cands.push({ fileId: fid, key, path: key.path });
-    if (cands.length <= this.deleteThreshold) {
+    if (pushed + cands.length <= this.deleteThreshold) {
       for (const [, key] of this.parkedDeletes) this.dirty.mark(key, "retry");
       this.parkedDeletes.clear();
+      this.parkedWindowBase = 0;
       return true;
     }
+    // D12 (클로드 제안(미승인)): the deletes pushed in the window count too; only this loop's are held.
+    this.parkedWindowBase = pushed;
     for (const c of cands) this.parkedDeletes.set(c.fileId, c.key);
-    this.raiseMassDelete(cands.length, cands.map((c) => c.path));
+    this.raiseMassDelete(pushed + cands.length, cands.map((c) => c.path));
     return true;
   }
 
@@ -1487,13 +1516,16 @@ export class ShuttleEngine implements Engine {
       this.guardedDeletes.add(fileId);
       return true;
     }
-    this.deletesThisIteration++;
-    if (this.deletesThisIteration > this.deleteThreshold) {
-      // Deletes the pre-count did not foresee (events during the pass): hold them and ask.
+    const pushed = this.windowDeletes();
+    if (!this.recentDeletes.has(fileId) && pushed + 1 > this.deleteThreshold) {
+      // Deletes the pre-count did not foresee (events during the pass, or earlier loops in the
+      // D12 window): hold them and ask.
+      if (this.parkedDeletes.size === 0) this.parkedWindowBase = pushed;
       this.parkedDeletes.set(fileId, { fileId, path });
-      this.raiseMassDelete(this.deletesThisIteration, [path]);
+      this.raiseMassDelete(Math.max(pushed, this.parkedWindowBase) + this.parkedDeletes.size, [path]);
       return false;
     }
+    this.recentDeletes.set(fileId, this.deps.clock.monotonic());
     return true;
   }
 

@@ -3,7 +3,7 @@
 
 import { describe, expect, it } from "vitest";
 import type { GuardEvent } from "@shuttle/protocol";
-import { GuardBoard, looksEmpty, massDeleteThreshold } from "../src/index";
+import { DELETE_WINDOW_MS, GuardBoard, looksEmpty, massDeleteThreshold } from "../src/index";
 import { Node, makeWorld, serverMap, syncAll } from "./engineHarness";
 
 const deletes = (n: Node): number => n.w.server.inspect().log.filter((r) => r.kind === "del").length;
@@ -150,6 +150,8 @@ describe("I22 guards trip", () => {
     for (const p of victims.slice(0, 15)) b.fs.external.remove(p);
     b.engine.requestScan();
     await b.sync();
+    // The passes are further apart than beta's own window (D12), so beta's local guard stays quiet.
+    w.clock.tick(DELETE_WINDOW_MS + 1);
     for (const p of victims.slice(15)) b.fs.external.remove(p);
     b.engine.requestScan();
     await b.sync();
@@ -162,6 +164,63 @@ describe("I22 guards trip", () => {
     await a.sync();
     expect(a.fs.files().size).toBe(10);
     expect(a.fs.trash.length).toBe(30);
+  });
+
+  it("massDeleteLocal across loops: 20 then 10 deletes within the window trip the guard (D12)", async () => {
+    const { w, a, init, guards } = await syncedVault("guard-window", 40);
+    const victims = Object.keys(init).slice(0, 30);
+    const t0 = w.clock.monotonic();
+    for (const p of victims.slice(0, 20)) a.fs.external.remove(p);
+    a.engine.requestScan();
+    await a.sync();
+    expect(guards).toEqual([]);
+    expect(deletes(a)).toBe(20);
+    for (const p of victims.slice(20)) a.fs.external.remove(p);
+    a.engine.requestScan();
+    await a.sync();
+    expect(w.clock.monotonic() - t0).toBeLessThan(DELETE_WINDOW_MS);
+    // Already pushed deletes are not recalled; the rest of the burst waits for an answer.
+    expect(deletes(a)).toBe(20);
+    expect(a.engine.status()).toMatchObject({ status: "paused", reason: "massDeleteLocal" });
+    expect(guards.map((g) => g.kind)).toEqual(["massDeleteLocal"]);
+    expect(guards[0]).toMatchObject({ n: 30 });
+    a.engine.answerGuard(guards[0]!.id, "apply");
+    await a.sync();
+    expect(deletes(a)).toBe(30);
+    expect(a.engine.status().status).toBe("synced");
+  });
+
+  it("massDeleteLocal across loops: a pause keeps the rest held after the window ages out (D12)", async () => {
+    const { w, a, init, guards } = await syncedVault("guard-window-pause", 40);
+    const victims = Object.keys(init).slice(0, 30);
+    for (const p of victims.slice(0, 20)) a.fs.external.remove(p);
+    a.engine.requestScan();
+    await a.sync();
+    for (const p of victims.slice(20)) a.fs.external.remove(p);
+    a.engine.requestScan();
+    await a.sync();
+    a.engine.answerGuard(guards[0]!.id, "pause");
+    w.clock.tick(DELETE_WINDOW_MS + 1);
+    a.engine.resume();
+    await a.engine.whenConnected();
+    await a.sync();
+    expect(deletes(a)).toBe(20);
+    expect(guards.length).toBe(2);
+    expect(guards[1]).toMatchObject({ kind: "massDeleteLocal", n: 30 });
+  });
+
+  it("massDeleteLocal across loops: halves more than the window apart do not trip (D12)", async () => {
+    const { w, a, init, guards } = await syncedVault("guard-window-apart", 40);
+    const victims = Object.keys(init).slice(0, 30);
+    for (const p of victims.slice(0, 20)) a.fs.external.remove(p);
+    a.engine.requestScan();
+    await a.sync();
+    w.clock.tick(DELETE_WINDOW_MS + 1);
+    for (const p of victims.slice(20)) a.fs.external.remove(p);
+    a.engine.requestScan();
+    await a.sync();
+    expect(guards).toEqual([]);
+    expect(deletes(a)).toBe(30);
   });
 
   it("massDeleteLocal: one answer covers the whole burst (watcher deletes keep arriving, §7.7)", async () => {

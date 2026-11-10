@@ -20,6 +20,7 @@ import { Session } from "./session/Session";
 import type { SetupEnv } from "./session/serverSetup";
 import { caseInsensitive, defaultDeviceName, localPlatform, osOf, platformName, type PlatformInfo } from "./util/platformInfo";
 import { assertNoSecrets } from "./util/redact";
+import { buildManifest } from "./util/manifest";
 import { fromParams } from "./util/enrollCode";
 import { StatusIcon } from "./ui/StatusIcon";
 import { uiView, type UiView } from "./ui/status";
@@ -298,6 +299,30 @@ export default class ShuttlePlugin extends Plugin {
     }).open();
   }
 
+  /** Cutover stage 1 (design §6.2.2): a read-only manifest of this vault, saved as a download (outside the vault). */
+  private async exportManifest(): Promise<void> {
+    const progress = new Notice(t("notice.manifestProgress", { n: 0 }), 0);
+    try {
+      const { text, files } = await buildManifest(this.app.vault.adapter, this.app.vault.configDir, undefined,
+        (n) => progress.setMessage(t("notice.manifestProgress", { n })));
+      const d = new Date();
+      const name = `shuttle-manifest-${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}.tsv`;
+      const url = URL.createObjectURL(new Blob([text], { type: "text/tab-separated-values" }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      progress.hide();
+      new Notice(t("notice.manifestDone", { n: files, name }), 10_000);
+    } catch (err) {
+      progress.hide();
+      new Notice(t("notice.manifestFailed", { error: err instanceof Error ? err.message : String(err) }), 10_000);
+    }
+  }
+
   private copyDebug(): void {
     const s = this.session;
     const p = this.store.activeProfile();
@@ -396,6 +421,7 @@ export default class ShuttlePlugin extends Plugin {
     this.addCommand({ id: "set-up", name: t("cmd.setUp"), callback: () => this.openWizard() });
     this.addCommand({ id: "unlock", name: t("cmd.unlock"), checkCallback: (c) => { if (!running() || !this.isLocked()) return false; if (!c) this.openUnlock(); return true; } });
     this.addCommand({ id: "copy-debug", name: t("cmd.copyDebug"), callback: () => this.copyDebug() });
+    this.addCommand({ id: "export-manifest", name: t("cmd.exportManifest"), callback: () => void this.exportManifest() });
     this.addCommand({ id: "add-device", name: t("cmd.addDevice"), checkCallback: (c) => { if (!running() || !this.session?.adapter) return false; if (!c) this.addDevice(null); return true; } });
     this.addCommand({ id: "rebuild-local", name: t("cmd.rebuildLocal"), checkCallback: (c) => { if (!running()) return false; if (!c) this.session?.rebuildLocal(); return true; } });
   }

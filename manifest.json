@@ -1,9 +1,9 @@
 {
-  "id": "shuttle-spike",
-  "name": "Shuttle Spike",
-  "version": "0.0.1",
+  "id": "shuttle",
+  "name": "Shuttle",
+  "version": "0.1.0-dev.1",
   "minAppVersion": "1.8.7",
-  "description": "P0 platform spike for Shuttle. Not for release.",
+  "description": "End-to-end encrypted sync for your vault through your own server or S3-compatible storage, with conflict merging, selective sync and settings sync.",
   "author": "Wangyu Choi",
   "isDesktopOnly": false
 }

@@ -1,6 +1,6 @@
 // Plugin side of headless key provisioning by pairing (design §4.12.2, §5.5.9 "Add server mirror").
 //
-// The headless client shows `obsidian://shuttle-pair?v=1&vault=<vaultId>&id=<pairId>&pk=<b64u pkH>`.
+// The headless client shows `obsidian://shuttle-pair?v=1&vid=<vaultId>&id=<pairId>&pk=<b64u pkH>`.
 // This device seals {vaultId, keys, infoRev} to pkH with ECDH P-256 + HKDF-SHA256 + AES-GCM and puts
 // the envelope into the server mailbox; the headless client checks the keys against the live
 // vault-info before it writes anything. The wire format is defined once in design §4.12.2; this file
@@ -46,7 +46,8 @@ export function parsePairLink(input: string | Record<string, string | undefined>
   } else {
     q = { get: (k) => input[k] ?? null };
   }
-  const vaultId = q.get("vault");
+  // `vid` since 0.1.0-dev.3; `vault` (older headless builds) only when pasted, Obsidian swallows it.
+  const vaultId = q.get("vid") ?? q.get("vault");
   const pairId = q.get("id");
   const pkH = q.get("pk");
   if (q.get("v") !== String(PAIR_VERSION) || !vaultId || !pairId || !pkH) throw new PairLinkError("not a shuttle pairing link");

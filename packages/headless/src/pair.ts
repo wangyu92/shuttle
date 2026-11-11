@@ -1,7 +1,7 @@
 // Key provisioning by pairing (design §4.12.2): no passphrase on the NAS or in chat.
 //
 // Headless side (pair-init): ephemeral ECDH P-256 (skH, pkH) and a 16-byte pairId; skH stays in memory.
-// The link `obsidian://shuttle-pair?v=1&vault=<vaultId>&id=<pairId>&pk=<b64u raw 65-byte pkH>` goes to the
+// The link `obsidian://shuttle-pair?v=1&vid=<vaultId>&id=<pairId>&pk=<b64u raw 65-byte pkH>` goes to the
 // user over the trusted channel (it carries only a public key). The unlocked plugin answers through
 // the mailbox with {pkP, nonce, ct}:
 //   Z  = ECDH(skP, pkH)
@@ -58,7 +58,9 @@ async function deriveK(z: ArrayBuffer, pairId: string, vaultId: string, pkH: str
 }
 
 export function pairingLink(vaultId: string, pairId: string, pkH: string): string {
-  const q = new URLSearchParams({ v: String(PAIR_VERSION), vault: vaultId, id: pairId, pk: pkH });
+  // `vid`, not `vault`: Obsidian reads `vault=` in any obsidian:// link as the local vault to open
+  // ("Vault not found" on the Mac, 0.1.0-dev.2 field report).
+  const q = new URLSearchParams({ v: String(PAIR_VERSION), vid: vaultId, id: pairId, pk: pkH });
   return `obsidian://shuttle-pair?${q.toString()}`;
 }
 
@@ -127,7 +129,7 @@ export async function sealPairingEnvelope(link: { vaultId: string; pairId: strin
 /** Parse a pairing link (plugin side and tests). */
 export function parsePairingLink(link: string): { vaultId: string; pairId: string; pkH: string } {
   const u = new URL(link);
-  const vaultId = u.searchParams.get("vault");
+  const vaultId = u.searchParams.get("vid") ?? u.searchParams.get("vault");
   const pairId = u.searchParams.get("id");
   const pkH = u.searchParams.get("pk");
   if (u.protocol !== "obsidian:" || u.searchParams.get("v") !== String(PAIR_VERSION) || !vaultId || !pairId || !pkH) {

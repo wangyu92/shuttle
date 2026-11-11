@@ -135,7 +135,7 @@ export class ShuttleSettingTab extends PluginSettingTab {
 
   private shape(): string {
     const p = this.host.profile();
-    return p ? `${p.id}|${this.host.locked() ? 1 : 0}` : "";
+    return p ? `${p.id}|${this.host.locked() ? 1 : 0}|${this.host.running() ? 1 : 0}` : "";
   }
 
   override hide(): void {

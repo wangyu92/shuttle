@@ -230,6 +230,9 @@ describe("vaults", () => {
     expect((await api(srv, c, "DELETE", `/v1/vaults/${v}`, undefined, { "X-Shuttle-Confirm": "doomed" })).status).toBe(202);
     expect((await ws.waitClose()).code).toBe(4404);
     expect((await api(srv, c, "GET", `/v1/vaults/${v}/info`)).status).toBe(404);
+    // The name is free again: a new vault of the same name gets a new id.
+    const again = await createVault(srv, c, "doomed");
+    expect(again).not.toBe(v);
   });
 });
 

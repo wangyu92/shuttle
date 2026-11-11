@@ -64,6 +64,7 @@ export class ShuttleSettingTab extends PluginSettingTab {
       a1.addButton((b) => b.setButtonText(t("btn.disconnect")).onClick(() => h.disconnect()));
     }
 
+    let a3Update: (() => void) | null = null;
     if (p) {
       // A3
       const a3 = new Setting(el).setName(t("set.status.name")).setDesc(h.tooltip());
@@ -75,11 +76,20 @@ export class ShuttleSettingTab extends PluginSettingTab {
         });
       });
       a3.addButton((b) => b.setButtonText(t("btn.syncNow")).onClick(() => h.syncNow()));
-      this.sub = h.onStatus(() => {
+      a3Update = () => {
         a3.setDesc(h.tooltip());
         pauseBtn?.setButtonText(h.status()?.status === "paused" ? t("btn.resume") : t("btn.pause"));
-      });
+      };
     }
+    // The structure above depends on the profile and the lock state: when either changes (setup
+    // finished, Disconnect, Reset, unlock), render the tab again. Deferred, because status listeners
+    // are being iterated when this runs and display() replaces this listener.
+    const shown = this.shape();
+    const sub = h.onStatus(() => {
+      if (this.shape() === shown) { a3Update?.(); return; }
+      setTimeout(() => { if (this.sub === sub) this.display(); }, 0);
+    });
+    this.sub = sub;
 
     const s = h.deviceSettings();
     // A5
@@ -121,6 +131,11 @@ export class ShuttleSettingTab extends PluginSettingTab {
       new Setting(el).setName(t("set.lock.name")).setDesc(t("set.lock.desc")).addButton((b) => b.setButtonText(t("btn.lock")).onClick(() => h.lock()));
     }
     new Setting(el).setName(t("set.reset.name")).setDesc(t("set.reset.desc")).addButton((b) => b.setButtonText(t("btn.reset")).setWarning().onClick(() => h.reset()));
+  }
+
+  private shape(): string {
+    const p = this.host.profile();
+    return p ? `${p.id}|${this.host.locked() ? 1 : 0}` : "";
   }
 
   override hide(): void {

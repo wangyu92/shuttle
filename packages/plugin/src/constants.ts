@@ -5,7 +5,7 @@ export const PLUGIN_ID = "shuttle";
 /** Display name (design §5: `PLUGIN_DISPLAY_NAME`, i18n `app.name`). */
 export const PLUGIN_DISPLAY_NAME = "SHUTTLE";
 /** Plugin version reported to the server and in debug info (kept equal to the engine version in v1). */
-export const PLUGIN_VERSION = "0.1.0-dev.1";
+export const PLUGIN_VERSION = "0.1.0-dev.2";
 /** Adapter type used in `remoteProfileId` (design UX-D1). Equals ServerAdapter.kind. */
 export const SERVER_ADAPTER_TYPE = "shuttle-server";
 /** Sidebar view type (design UX-D4). */

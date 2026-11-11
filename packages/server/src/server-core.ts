@@ -13,7 +13,7 @@ import { Store, type CommitOutcome, type VaultRow } from "./store";
 import { HttpError, MINUTE_MS, randomId16, sha256Hex } from "./util";
 import { Hub } from "./ws";
 
-export const SERVER_VERSION = "0.1.0";
+export const SERVER_VERSION = "0.1.1";
 /** Commits per group-commit transaction. */
 const MAX_GROUP = 256;
 
@@ -314,7 +314,10 @@ export class Server {
   }
 
   softDeleteVault(v: VaultRow): void {
-    this.s.run("UPDATE vaults SET deleted_at = ? WHERE vault_id = ? AND deleted_at IS NULL", this.cfg.now(), v.vault_id);
+    // The name is unique across all rows (db.ts); a deleted vault gives its name up so the owner can
+    // create a vault of the same name again. The vault id keeps the renamed row unique.
+    this.s.run("UPDATE vaults SET deleted_at = ?, name = name || '~deleted-' || vault_id WHERE vault_id = ? AND deleted_at IS NULL",
+      this.cfg.now(), v.vault_id);
     for (const c of this.hub.ofVault(v.vault_id)) c.fatal(null, "VAULT_NOT_FOUND", "vault deleted", CloseCode.VAULT_NOT_FOUND);
   }
 

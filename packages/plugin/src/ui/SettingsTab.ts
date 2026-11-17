@@ -3,7 +3,7 @@
 // The status row updates in place on status events (never a full re-render, §5.4.2).
 
 import { PluginSettingTab, Setting, type App, type Plugin } from "obsidian";
-import type { DeviceSettings, Disposable, EngineStatus, SelectiveClass } from "@shuttle/protocol";
+import type { ConfigCategory, DeviceSettings, Disposable, EngineStatus, SelectiveClass } from "@shuttle/protocol";
 import { t } from "../i18n";
 import type { Profile } from "../store/localStore";
 import { hostLabel } from "../util/url";
@@ -37,6 +37,12 @@ const SELECTIVE: Array<[SelectiveClass, string, string]> = [
   ["videos", "set.sel.videos", "mp4, webm, ogv, mov, mkv, m4v, avi"],
   ["pdfs", "set.sel.pdfs", "pdf"],
   ["other", "set.sel.other", "Any file that is not a note, image, audio, video or PDF."],
+];
+
+/** Settings-sync toggles in Obsidian Sync's order, with the engine defaults (DEFAULT_CONFIG_CATEGORIES). */
+const CONFIG_ROWS: ReadonlyArray<readonly [ConfigCategory, boolean]> = [
+  ["app", true], ["appearance", true], ["appearance-data", true], ["hotkey", true],
+  ["core-plugin", true], ["core-plugin-data", true], ["community-plugin", false], ["community-plugin-data", false],
 ];
 
 export class ShuttleSettingTab extends PluginSettingTab {
@@ -122,6 +128,19 @@ export class ShuttleSettingTab extends PluginSettingTab {
           const cur = { ...{ images: true, audio: true, videos: true, pdfs: true, other: true }, ...(h.deviceSettings().selective ?? {}) };
           cur[cls] = v;
           void h.updateSettings({ selective: cur });
+        }));
+    }
+
+    // C: settings sync (design §3.12; community plugins since D16)
+    new Setting(el).setHeading().setName(t("set.h.config"));
+    el.createEl("p", { cls: "setting-item-description", text: t("set.config.desc") });
+    for (const [cat, def] of CONFIG_ROWS) {
+      new Setting(el).setName(t(`set.cfg.${cat}`)).addToggle((x) => x
+        .setValue(s.configCategories?.[cat] ?? def)
+        .onChange((v) => {
+          const cur = Object.fromEntries(CONFIG_ROWS.map(([c, d]) => [c, h.deviceSettings().configCategories?.[c] ?? d])) as Record<ConfigCategory, boolean>;
+          cur[cat] = v;
+          void h.updateSettings({ configCategories: cur });
         }));
     }
 

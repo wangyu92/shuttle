@@ -6,7 +6,7 @@
 // because a force-quit on mobile never runs onunload anyway (P0 M21).
 
 import { Menu, Notice, Platform, Plugin, requestUrl, type ObsidianProtocolData } from "obsidian";
-import type { DeviceSettings, EngineStatus, GuardEvent, LogEntry } from "@shuttle/protocol";
+import type { ConfigAppliedEvent, DeviceSettings, EngineStatus, GuardEvent, LogEntry } from "@shuttle/protocol";
 import { DATA_JSON, PLUGIN_ID, PLUGIN_VERSION } from "./constants";
 import { t } from "./i18n";
 import { requestUrlHttpClient, type RequestUrlFn } from "./platform/http";
@@ -149,6 +149,7 @@ export default class ShuttlePlugin extends Plugin {
     this.session.on("status", (s) => this.onStatus(s));
     this.session.on("guard", (g) => this.onGuard(g));
     this.session.on("log", (e) => this.onLog(e));
+    this.session.on("configApplied", (e) => this.onConfigApplied(e));
     registerVisibilityHooks((target, type, cb) => this.registerDomEvent(target as Document, type as "visibilitychange", cb), document, window,
       (visible) => this.session?.onVisibility(visible));
 
@@ -222,6 +223,16 @@ export default class ShuttlePlugin extends Plugin {
       this.session?.answerGuard(g.id, choice);
       this.refreshIcon();
     }).open();
+  }
+
+  private lastReloadNotice = 0;
+
+  /** design §3.12: settings or plugins arrived that only take effect after a restart (one notice per minute). */
+  private onConfigApplied(e: ConfigAppliedEvent): void {
+    if (!e.needsReload || Date.now() - this.lastReloadNotice < 60_000) return;
+    this.lastReloadNotice = Date.now();
+    const plugins = e.categories.has("community-plugin") || e.categories.has("community-plugin-data");
+    new Notice(t(plugins ? "notice.reloadPlugins" : "notice.reloadManual"), 15_000);
   }
 
   private onLog(_e: LogEntry): void {

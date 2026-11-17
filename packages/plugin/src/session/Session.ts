@@ -4,7 +4,7 @@
 
 import { adapterStateStoreOver } from "@shuttle/protocol";
 import type {
-  Clock, DebugInfo, DeviceSettings, Disposable, EngineStatus, GuardChoice, GuardEvent, HttpClient, Keyring, LocalFs, LogEntry,
+  Clock, ConfigAppliedEvent, DebugInfo, DeviceSettings, Disposable, EngineStatus, GuardChoice, GuardEvent, HttpClient, Keyring, LocalFs, LogEntry,
   StateStore, VaultInfo, WsFactory,
 } from "@shuttle/protocol";
 import { ServerAdapter, helloSession } from "@shuttle/adapter-server";
@@ -39,6 +39,7 @@ export interface SessionEvents {
   status(s: EngineStatus | null): void;
   log(e: LogEntry): void;
   guard(g: GuardEvent): void;
+  configApplied(e: ConfigAppliedEvent): void;
 }
 
 type Listener<K extends keyof SessionEvents> = SessionEvents[K];
@@ -100,7 +101,7 @@ export class Session {
   keySource: KeyringSource = "none";
   private state: StateStore | null = null;
   private subs: Disposable[] = [];
-  private readonly listeners: { [K in keyof SessionEvents]: Set<Listener<K>> } = { status: new Set(), log: new Set(), guard: new Set() };
+  private readonly listeners: { [K in keyof SessionEvents]: Set<Listener<K>> } = { status: new Set(), log: new Set(), guard: new Set(), configApplied: new Set() };
   private starting: Promise<void> | null = null;
   private generation = 0;
   private logTotal = 0;
@@ -188,6 +189,7 @@ export class Session {
       engine.on("status", (s) => this.emit("status", s)),
       engine.on("log", (e) => { this.logTotal++; this.emit("log", e); }),
       engine.on("guard", (g) => this.emit("guard", g)),
+      engine.on("configApplied", (e) => this.emit("configApplied", e)),
     ];
     this.engine = engine;
     this.adapter = adapter;

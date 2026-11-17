@@ -1,6 +1,6 @@
 // configDir file → config sync category (design §3.12). Pure. The mapping is SHUTTLE's own.
-// v1 syncs the core categories; `community-plugin*` keep their names so v2 can turn them on without a
-// format change, but a v1 device treats them as `excluded` whatever the toggle says.
+// Every category follows its per-device toggle. `community-plugin*` (the enabled-plugin list and the
+// plugin folders) default to off and are turned on per device (lead decision D16, was v2).
 
 import type { ConfigCategory, LocalPlatform } from "@shuttle/protocol";
 
@@ -8,10 +8,8 @@ export const CONFIG_CATEGORIES: readonly ConfigCategory[] = [
   "app", "appearance", "appearance-data", "hotkey", "core-plugin", "core-plugin-data", "community-plugin", "community-plugin-data",
 ];
 
-/** Categories a v1 device may sync (design §3.12 column v1). */
-export const V1_CONFIG_CATEGORIES: ReadonlySet<ConfigCategory> = new Set<ConfigCategory>([
-  "app", "appearance", "appearance-data", "hotkey", "core-plugin", "core-plugin-data",
-]);
+/** Categories a device may sync (all of them since D16; the name is kept for callers). */
+export const V1_CONFIG_CATEGORIES: ReadonlySet<ConfigCategory> = new Set<ConfigCategory>(CONFIG_CATEGORIES);
 
 export const DEFAULT_CONFIG_CATEGORIES: Readonly<Record<ConfigCategory, boolean>> = Object.freeze({
   "app": true, "appearance": true, "appearance-data": true, "hotkey": true, "core-plugin": true, "core-plugin-data": true,
@@ -60,8 +58,11 @@ export function categoryEnabled(cat: ConfigCategory, toggles: Readonly<Partial<R
   return toggles[cat] ?? DEFAULT_CONFIG_CATEGORIES[cat];
 }
 
-/** Separate size cap for config files on mobile (design §3.11.2, pain 19). */
-export const MOBILE_CONFIG_MAX_BYTES = 5 * 1024 * 1024;
+/**
+ * Separate size cap for config files on mobile (design §3.11.2, pain 19). 32 MiB since D16: plugin
+ * bundles such as Excalidraw's main.js are several MiB and must reach phones whole.
+ */
+export const MOBILE_CONFIG_MAX_BYTES = 32 * 1024 * 1024;
 
 export function isMobile(p: LocalPlatform): boolean {
   return p === "ios" || p === "android";

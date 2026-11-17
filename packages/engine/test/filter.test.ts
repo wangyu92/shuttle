@@ -24,13 +24,15 @@ describe("PathFilter.scope order (design §3.11)", () => {
     expect(p.scope("notes/a.md")).toBe("active");
   });
 
-  it("own plugin data is ignored; other plugins are v2 (excluded)", () => {
+  it("own plugin data is ignored; other plugins follow their toggles (D16), off by default", () => {
     const p = f({ configCategories: { ...DEFAULT_CONFIG_CATEGORIES, "community-plugin-data": true, "community-plugin": true } });
     expect(p.scope(".obsidian/plugins/shuttle/data.json")).toBe("ignored");
     expect(p.scope(".obsidian/plugins/shuttle")).toBe("ignored");
-    // v1 devices treat community-plugin* as excluded whatever the toggle says.
-    expect(p.scope(".obsidian/plugins/other/main.js")).toBe("excluded");
-    expect(p.scope(".obsidian/community-plugins.json")).toBe("excluded");
+    expect(p.scope(".obsidian/plugins/other/main.js")).toBe("active");
+    expect(p.scope(".obsidian/community-plugins.json")).toBe("active");
+    const off = f({});
+    expect(off.scope(".obsidian/plugins/other/main.js")).toBe("excluded");
+    expect(off.scope(".obsidian/community-plugins.json")).toBe("excluded");
   });
 
   it("temp patterns are ignored (design §3.11.5)", () => {

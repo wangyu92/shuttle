@@ -240,8 +240,9 @@ export class ServerWizard extends Modal {
       this.vaults = null;
       this.step = "vault";
       this.checklist = [];
-      void this.loadVaults();
     });
+    // After run() has finished: loadVaults() goes through run() too, which returns at once while busy.
+    if (this.step === "vault" && this.vaults === null) await this.loadVaults();
   }
 
   // ---------- step 3 (§5.5.5) ----------

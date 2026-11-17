@@ -34,8 +34,10 @@ export async function requestUrl(): Promise<never> {
 export class Notice {
   static shown: string[] = [];
   noticeEl = new FakeEl();
-  constructor(readonly message: string, readonly timeout?: number) { Notice.shown.push(message); }
-  hide(): void {}
+  static hidden = 0;
+  constructor(public message: string, readonly timeout?: number) { Notice.shown.push(message); }
+  setMessage(m: string): this { this.message = m; Notice.shown.push(m); return this; }
+  hide(): void { Notice.hidden++; }
 }
 
 export interface Command { id: string; name: string; callback?: () => unknown; checkCallback?: (checking: boolean) => boolean | void }

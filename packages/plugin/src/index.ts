@@ -5,6 +5,7 @@
 // events, the state DB, the engine) starts in workspace.onLayoutReady. onunload stops the engine without waiting for it,
 // because a force-quit on mobile never runs onunload anyway (P0 M21).
 
+import { SyncProgress } from "./ui/progress";
 import { Menu, Notice, Platform, Plugin, requestUrl, type ObsidianProtocolData } from "obsidian";
 import type { ConfigAppliedEvent, DeviceSettings, EngineStatus, GuardEvent, LogEntry } from "@shuttle/protocol";
 import { DATA_JSON, PLUGIN_ID, PLUGIN_VERSION } from "./constants";
@@ -105,6 +106,7 @@ export default class ShuttlePlugin extends Plugin {
   override onunload(): void {
     this.unloaded = true;
     this.icon?.dispose();
+    this.progress.dispose();
     const s = this.session;
     this.session = null;
     const sched = this.scheduler;
@@ -200,8 +202,11 @@ export default class ShuttlePlugin extends Plugin {
     for (const cb of this.statusListeners) cb();
   }
 
+  private readonly progress = new SyncProgress();
+
   private onStatus(s: EngineStatus | null): void {
     this.refreshIcon();
+    this.progress.update(s);
     const reason = this.errorGate.next(s, Date.now());
     if (reason) {
       const n = new Notice(t("notice.error", { reason: reasonText(reason) }), 10_000);

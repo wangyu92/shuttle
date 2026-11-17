@@ -16,6 +16,10 @@ export const EN: Readonly<Record<string, string>> = Object.freeze({
   "status.pausedGuard": "Paused: waiting for your decision.",
   "status.syncing": "Syncing: {up} to upload, {down} to download.",
   "status.synced": "Fully synced.",
+  "progress.down": "SHUTTLE: downloading, {down} files left…",
+  "progress.up": "SHUTTLE: uploading, {up} files left…",
+  "progress.both": "SHUTTLE: {down} to download, {up} to upload…",
+  "progress.done": "SHUTTLE: all files synced.",
   "reason.offline": "No network connection.",
   "reason.unreachable": "Unable to connect to server.",
 

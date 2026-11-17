@@ -148,6 +148,14 @@ export class ObsidianLocalFs implements LocalFs {
     return typeof a.fsPromises?.rename === "function" && typeof a.getFullPath === "function";
   }
 
+  /**
+   * D15: on mobile an existing file is replaced in place (Vault.modifyBinary), because the D11 swap
+   * moves the target aside and Obsidian closes the editor that shows it (seen on Android, 2026-11-17).
+   */
+  get inPlaceReplace(): boolean {
+    return !this.renameReplaces;
+  }
+
   constructor(o: ObsidianLocalFsOptions) {
     this.vault = o.vault;
     this.fm = o.fileManager;

@@ -48,6 +48,13 @@ export interface LocalFs {
    */
   readonly renameReplaces?: boolean;
   /**
+   * Lead decision D15: true when the platform must write an existing file in place for open editors to
+   * keep it (Obsidian mobile: the D11 swap moves the target aside and the editor showing it closes).
+   * The engine then replaces with one write() and accepts that a crash may tear the target; the write
+   * intent (§3.8.4) finds the torn file on the next start and pulls it again.
+   */
+  readonly inPlaceReplace?: boolean;
+  /**
    * Lead decision D11: engine-internal leftovers (any path with a segment starting with `.shuttle-`)
    * where listAll() does not return them (Obsidian indexes no dot names). Absent: the engine filters
    * listAll({ includeConfigDir: true }) instead.

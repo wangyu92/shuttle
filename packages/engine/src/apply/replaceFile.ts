@@ -134,6 +134,7 @@ export async function replaceFile(fs: LocalFs, path: string, data: Uint8Array, o
   await fs.mkdirp(dir).catch(() => undefined);
   await settleLeftovers(fs, path);
   if (fs.atomicReplace === true) return fs.write(path, data, opts);       // D10
+  if (fs.inPlaceReplace === true && (await fs.stat(path)) !== null) return fs.write(path, data, opts); // D15
   const tmp = join(dir, `${REPLACE_TEMP_PREFIX}${nextSeq(fs)}`);
   let flying = inFlight.get(fs);
   if (!flying) inFlight.set(fs, (flying = new Set()));

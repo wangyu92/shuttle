@@ -148,16 +148,24 @@ describe("ObsidianLocalFs", () => {
     expect(v.calls.filter((c) => c.includes("n.md"))).toEqual([]);
   });
 
-  it("D11: replaceFile on mobile swaps through a backup folder, then removes it", async () => {
+  it("D15: replaceFile on mobile writes an existing note in place (an open editor keeps it): no rename, no backup", async () => {
     const { v, fs } = setup();
+    expect(fs.inPlaceReplace).toBe(true);
     await fs.write("d/n.md", te.encode("old"), { mtime: 1 });
     v.calls.length = 0;
     await replaceFile(fs, "d/n.md", te.encode("new!"), { mtime: 2 });
     expect(v.text("d/n.md")).toBe("new!");
-    expect(v.calls.some((c) => c === "modifyBinary:d/n.md" || c === "adapter.writeBinary:d/n.md")).toBe(false);
+    expect(v.calls).toContain("modifyBinary:d/n.md");
+    expect(v.calls.some((c) => c.startsWith("rename") || c.includes("adapter.rename") || c.includes("shuttle-bak"))).toBe(false);
     const left: string[] = [];
     for await (const b of fs.listInternal()) for (const s of b) left.push(s.path);
     expect(left).toEqual([]);
+  });
+
+  it("D15: a new file on mobile still goes through the temp (nothing open to keep)", async () => {
+    const { v, fs } = setup();
+    await replaceFile(fs, "d/new.md", te.encode("hi"), { mtime: 2 });
+    expect(v.text("d/new.md")).toBe("hi");
   });
 
   it("D11: listInternal finds swap leftovers Vault does not index (also under the configuration folder)", async () => {

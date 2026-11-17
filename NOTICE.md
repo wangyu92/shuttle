@@ -20,5 +20,7 @@ No code is taken from Obsidian LiveSync (or its commonlib) or from remotely-save
 | diff-match-patch | Apache-2.0 | engine (bundled into plugin and headless) |
 | ws | MIT | headless, server |
 | fflate | MIT | crypto (fallback when `CompressionStream("deflate-raw")` is missing) |
+| qrcode-generator 2.0.4 | MIT | plugin (Add device QR code) |
+| jsQR 1.4.0 | Apache-2.0 | plugin tests only (decodes the QR code back), not bundled |
 
 Bundled third-party license comments are emitted next to each bundle by esbuild (`legalComments: "linked"`).

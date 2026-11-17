@@ -503,6 +503,14 @@ export async function serverLogin(o: AuthOptions, username: string, password: st
   return { ...need(validateAuthResponse(data), "login"), url };
 }
 
+/** POST /v1/auth/setup: first-run owner creation with the code from the server log (lead decision D14). */
+export async function serverSetup(o: AuthOptions, code: string, username: string, password: string, device: DeviceDescriptor): Promise<AuthResponse & { url: string }> {
+  const rest = anonymousRest(o);
+  const url = await rest.base();
+  const { data } = await rest.json("POST", "/auth/setup", "setup", { code, username, password, device }, { auth: false });
+  return { ...need(validateAuthResponse(data), "setup"), url };
+}
+
 /** POST /v1/auth/enroll with a single-use code (design §2.8.4). */
 export async function serverEnroll(o: AuthOptions, code: string, device: DeviceDescriptor): Promise<AuthResponse & { url: string }> {
   const rest = anonymousRest(o);

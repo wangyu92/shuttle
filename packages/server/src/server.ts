@@ -2,7 +2,7 @@
 import { createServer, type Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { WebSocketServer } from "ws";
-import { CloseCode, MAX_WS_FRAME, WS_PATH, WS_SUBPROTOCOL } from "@shuttle/protocol";
+import { CloseCode, ENROLL_URI_ACTION, MAX_WS_FRAME, WS_PATH, WS_SUBPROTOCOL } from "@shuttle/protocol";
 import { resolveConfig, type ServerOptions } from "./config";
 import { Maintenance, type GcStats } from "./gc";
 import { clientIp, handleRest, originAllowed } from "./rest";
@@ -84,6 +84,13 @@ export async function startServer(opts: ServerOptions): Promise<RunningServer> {
   });
   const port = (http.address() as AddressInfo).port;
   cfg.log(`shuttle-server ${SERVER_VERSION} listening on http://${cfg.host}:${port}`);
+  // First-run setup (lead decision D14): the code is shown only here, only while there are no users.
+  const setupCode = core.openSetup();
+  if (setupCode) {
+    cfg.log(`FIRST-RUN SETUP: this server has no owner yet. In SHUTTLE choose Set up, then "New server", and enter this setup code: ${setupCode}`);
+    if (cfg.publicUrl) cfg.log(`FIRST-RUN SETUP link: obsidian://${ENROLL_URI_ACTION}?server=${encodeURIComponent(cfg.publicUrl)}&code=${encodeURIComponent(setupCode)}&setup=1`);
+    cfg.log("The code works once and changes on every restart until the owner exists.");
+  }
 
   let closed: Promise<void> | null = null;
   return {

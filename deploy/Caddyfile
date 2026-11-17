@@ -1,0 +1,5 @@
+# HTTPS in front of SHUTTLE (profile "https"). Caddy gets a certificate for SHUTTLE_DOMAIN by itself;
+# the domain's DNS must point at this machine and ports 80 and 443 must be reachable from the internet.
+{$SHUTTLE_DOMAIN} {
+	reverse_proxy shuttle:8787
+}

@@ -1,8 +1,9 @@
 // Add another device (design §5.5.9): a one-time enrollment code (POST /v1/enroll-codes, 15 min) shown
 // as text and link with Copy buttons and a countdown; the device list is polled every 3 s and the
-// modal closes 2 s after a new device joins. The QR code of the design needs a bundled QR encoder,
-// which the dev plugin does not have yet (open issue). Second part: "Add server mirror" seals the key
-// bundle to a headless pairing link (design §4.12.2).
+// modal closes 2 s after a new device joins. The link is also shown as a QR code (util/qr.ts) for a
+// phone camera; whether the camera hands `obsidian://` to Obsidian is unverified on iOS (M19), so the
+// copy buttons stay. Second part: "Add server mirror" seals the key bundle to a headless pairing link
+// (design §4.12.2).
 
 import { Modal, Notice, Setting, type App } from "obsidian";
 import { isRemoteError, type AdapterDevice, type RemoteAdapter } from "@shuttle/protocol";
@@ -11,6 +12,7 @@ import { DEVICE_POLL_MS, ENROLL_CODE_TTL_SEC } from "../constants";
 import { t } from "../i18n";
 import { parsePairLink, payloadOf, sealPairingEnvelope } from "../session/pairing";
 import { ConfirmModal, copyText } from "./modals";
+import { drawQr } from "../util/qr";
 
 export interface AddDeviceHost {
   adapter: Pick<RemoteAdapter, "createEnrollCode" | "listDevices" | "getVaultInfo" | "pairingPut">;
@@ -57,6 +59,12 @@ export class AddDeviceModal extends Modal {
     if (this.closed) return;
     box.empty();
     box.createEl("p", { text: t("dev.add.steps") });
+    const qr = box.createEl("canvas", { cls: "shuttle-qr" });
+    try {
+      drawQr(qr, r.link, 220, window.devicePixelRatio || 1);
+    } catch {
+      qr.remove();
+    }
     box.createDiv({ cls: "shuttle-code", text: r.code });
     const exp = box.createDiv({ cls: "setting-item-description" });
     new Setting(box)
@@ -66,6 +74,7 @@ export class AddDeviceModal extends Modal {
       const left = r.expiresAt - Date.now();
       if (left <= 0) {
         exp.setText(t("dev.add.expired"));
+        qr.remove();
         this.clearTimers();
         new Setting(box).addButton((b) => b.setButtonText(t("btn.newCode")).setCta().onClick(() => { void this.newCode(box); }));
         return;

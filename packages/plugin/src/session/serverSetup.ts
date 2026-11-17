@@ -8,7 +8,7 @@ import {
 import type {
   AuthResponse, DeviceDescriptor, HttpClient, Scheduler, VaultInfo, VaultSummary, WsFactory,
 } from "@shuttle/protocol";
-import { RestClient, ServerAdapter, serverEnroll, serverLogin } from "@shuttle/adapter-server";
+import { RestClient, ServerAdapter, serverEnroll, serverLogin, serverSetup } from "@shuttle/adapter-server";
 import { createVault, isCryptoError, unlock, type CachedSecrets, type Keyring as CryptoKeyring, type Seen, type VaultInfo as CryptoVaultInfo } from "@shuttle/crypto";
 import { normalizeBaseUrls } from "@shuttle/adapter-server";
 import { redact } from "../util/redact";
@@ -124,13 +124,17 @@ function authOpts(env: SetupEnv, c: Connection): { urls: string[]; http: HttpCli
   return { urls: c.urls, http: env.http, allowHttp: c.allowHttp, scheduler: env.scheduler };
 }
 
-export type SignInMethod = { code: string } | { username: string; password: string };
+export type SignInMethod =
+  | { code: string }
+  | { username: string; password: string }
+  | { setupCode: string; username: string; password: string };
 
 /** design §5.5.3 step 2: /v1/auth/enroll or /v1/auth/login. */
 export async function signIn(env: SetupEnv, c: Connection, method: SignInMethod, deviceName: string): Promise<AuthResponse & { url: string }> {
   const device: DeviceDescriptor = { name: deviceName, platform: env.client.platform, clientVersion: env.client.version };
-  const ctx = "code" in method ? "enroll" : "login";
+  const ctx = "code" in method || "setupCode" in method ? "enroll" : "login";
   try {
+    if ("setupCode" in method) return await serverSetup(authOpts(env, c), method.setupCode, method.username, method.password, device);
     return "code" in method
       ? await serverEnroll(authOpts(env, c), method.code, device)
       : await serverLogin(authOpts(env, c), method.username, method.password, device);

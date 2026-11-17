@@ -71,9 +71,9 @@ export interface ResolvedConfig {
   log: (msg: string) => void;
 }
 
-// The AGPL source offer (design §8.6). Operators set SHUTTLE_SOURCE_URL; the public repo URL replaces
-// this placeholder once the repository is published.
-export const DEFAULT_SOURCE_URL = "https://example.com/shuttle/source";
+// The AGPL source offer (design §8.6): the public repository. Operators who change the server set
+// SHUTTLE_SOURCE_URL to their own source.
+export const DEFAULT_SOURCE_URL = "https://github.com/wangyu92/shuttle";
 export const DEFAULT_SCRYPT: ScryptParams = Object.freeze({ N: 1 << 15, r: 8, p: 1 });
 export const DEFAULT_RATES: RateLimits = Object.freeze({ commitsPerSec: 20, blobReqPerSec: 200, loginFailuresPerMin: 5 });
 

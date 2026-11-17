@@ -5,13 +5,13 @@
 // the server, as §5.5.1 says).
 
 import { Modal, Notice, Setting, type App } from "obsidian";
-import type { AuthResponse, VaultSummary } from "@shuttle/protocol";
+import { MIN_OWNER_PASSWORD, USERNAME_RE, type AuthResponse, type VaultSummary } from "@shuttle/protocol";
 import { t } from "../i18n";
 import { defaultEndpointLabel, hostLabel, normalizeServerUrl } from "../util/url";
 import { normalizeEnrollCode, parseSetupInput, type EnrollLink } from "../util/enrollCode";
 import {
   SetupError, classify, createRemoteVault, listVaults, probeEndpoints, signIn, unlockVault,
-  type Connection, type SetupEnv, type SetupResult,
+  type Connection, type SetupEnv, type SetupResult, type SignInMethod,
 } from "../session/serverSetup";
 import type { DeviceStore, Profile } from "../store/localStore";
 import { commitSetup } from "../session/commit";
@@ -39,7 +39,7 @@ type Step = "server" | "vault" | "unlock" | "ready";
 const STEP_NO: Record<Step, number> = { server: 1, vault: 2, unlock: 3, ready: 4 };
 
 interface Form {
-  url: string; url2: string; allowHttp: boolean; method: "code" | "password"; code: string; user: string; pass: string; device: string;
+  url: string; url2: string; allowHttp: boolean; method: "code" | "password" | "setup"; code: string; user: string; pass: string; pass2: string; device: string;
 }
 
 export class ServerWizard extends Modal {
@@ -58,8 +58,9 @@ export class ServerWizard extends Modal {
   constructor(app: App, private readonly host: WizardHost, prefill: EnrollLink | null = null) {
     super(app);
     this.f = {
-      url: prefill?.server ?? "", url2: "", allowHttp: false, method: prefill?.code || !prefill ? "code" : "password",
-      code: prefill?.code ?? "", user: "", pass: "", device: host.deviceName(),
+      url: prefill?.server ?? "", url2: "", allowHttp: false,
+      method: prefill?.setup ? "setup" : prefill?.code || !prefill ? "code" : "password",
+      code: prefill?.code ?? "", user: "", pass: "", pass2: "", device: host.deviceName(),
     };
   }
 
@@ -70,6 +71,7 @@ export class ServerWizard extends Modal {
 
   override onClose(): void {
     this.f.pass = "";
+    this.f.pass2 = "";
     this.contentEl.empty();
   }
 
@@ -126,7 +128,7 @@ export class ServerWizard extends Modal {
         const p = parseSetupInput(v);
         if (!p) return;
         if (p.server) this.f.url = p.server;
-        if (p.code) { this.f.code = p.code; this.f.method = "code"; }
+        if (p.code) { this.f.code = p.code; this.f.method = p.setup ? "setup" : "code"; }
         this.render();
       });
     });
@@ -142,9 +144,29 @@ export class ServerWizard extends Modal {
     });
     new Setting(el).setName(t("wiz.server.allowHttp")).addToggle((x) => x.setValue(this.f.allowHttp).onChange((v) => { this.f.allowHttp = v; }));
     new Setting(el).setName(t("wiz.server.method")).addDropdown((d) => d
-      .addOption("code", t("wiz.server.code")).addOption("password", t("wiz.server.password"))
-      .setValue(this.f.method).onChange((v) => { this.f.method = v === "password" ? "password" : "code"; this.render(); }));
-    if (this.f.method === "code") {
+      .addOption("code", t("wiz.server.code")).addOption("password", t("wiz.server.password")).addOption("setup", t("wiz.server.setup"))
+      .setValue(this.f.method).onChange((v) => { this.f.method = v === "password" || v === "setup" ? v : "code"; this.render(); }));
+    if (this.f.method === "setup") {
+      el.createEl("p", { cls: "setting-item-description", text: t("wiz.server.setupHelp") });
+      new Setting(el).setName(t("wiz.server.setupField")).addText((x) => {
+        x.setPlaceholder("SXE-XXXX-XXXX-XXXX-XXXX-XXXX").setValue(this.f.code).onChange((v) => { this.f.code = v; });
+        x.inputEl.autocapitalize = "characters";
+      });
+      new Setting(el).setName(t("wiz.server.user")).addText((x) => {
+        x.setValue(this.f.user).onChange((v) => { this.f.user = v; });
+        x.inputEl.autocapitalize = "off";
+      });
+      new Setting(el).setName(t("wiz.server.newPass")).addText((x) => {
+        x.inputEl.type = "password";
+        x.inputEl.autocomplete = "new-password";
+        x.setValue(this.f.pass).onChange((v) => { this.f.pass = v; });
+      });
+      new Setting(el).setName(t("wiz.server.newPass2")).addText((x) => {
+        x.inputEl.type = "password";
+        x.inputEl.autocomplete = "new-password";
+        x.setValue(this.f.pass2).onChange((v) => { this.f.pass2 = v; });
+      });
+    } else if (this.f.method === "code") {
       new Setting(el).setName(t("wiz.server.codeField")).addText((x) => {
         x.setPlaceholder("SXE-XXXX-XXXX-XXXX-XXXX-XXXX").setValue(this.f.code).onChange((v) => { this.f.code = v; });
         x.inputEl.autocapitalize = "characters";
@@ -173,8 +195,15 @@ export class ServerWizard extends Modal {
         if (!urls.some((x) => x.url === u.url)) urls.push({ url: u.url, label: defaultEndpointLabel(u.url), insecure: u.insecure });
       }
       if (!this.f.device.trim()) throw new InputError("err.required");
-      let method: { code: string } | { username: string; password: string };
-      if (this.f.method === "code") {
+      let method: SignInMethod;
+      if (this.f.method === "setup") {
+        const c = normalizeEnrollCode(this.f.code);
+        if (!c) throw new InputError("err.codeFormat");
+        if (!USERNAME_RE.test(this.f.user.trim())) throw new InputError("err.username");
+        if (this.f.pass !== this.f.pass2) throw new InputError("err.pwMismatch");
+        if (this.f.pass.length < MIN_OWNER_PASSWORD) throw new InputError("err.ownerPwShort");
+        method = { setupCode: c, username: this.f.user.trim(), password: this.f.pass };
+      } else if (this.f.method === "code") {
         const c = normalizeEnrollCode(this.f.code);
         if (!c) throw new InputError("err.codeFormat");
         method = { code: c };
@@ -202,6 +231,7 @@ export class ServerWizard extends Modal {
       const conn: Connection = { urls: urls.map((u) => u.url), allowHttp: this.f.allowHttp };
       const auth = await signIn(this.host.env, conn, method, this.f.device.trim());
       this.f.pass = "";
+      this.f.pass2 = "";
       this.checklist[this.checklist.length - 1] = { ok: true, text: t("wiz.check.signedIn") };
       await this.host.setDeviceName(this.f.device.trim());
       this.conn = conn;

@@ -1,0 +1,40 @@
+# SHUTTLE server, self-hosted. Copy this folder, fill in .env (see .env.example), then:
+#   docker compose up -d                       # server only, put your own HTTPS proxy in front
+#   docker compose --profile https up -d       # server + Caddy with an automatic Let's Encrypt certificate
+#   docker compose logs shuttle | grep SETUP   # the one-time first-run setup code
+# Data lives in the named volume `shuttle-data`; back it up with the server stopped.
+services:
+  shuttle:
+    image: ghcr.io/wangyu92/shuttle-server:${SHUTTLE_VERSION:-0.2.0}
+    restart: unless-stopped
+    environment:
+      SHUTTLE_PUBLIC_URL: ${SHUTTLE_PUBLIC_URL:?set SHUTTLE_PUBLIC_URL in .env}
+      SHUTTLE_TRUST_PROXY: "1"
+      NODE_OPTIONS: --max-old-space-size=256 --disable-warning=ExperimentalWarning
+      TZ: ${TZ:-UTC}
+    volumes:
+      - shuttle-data:/data
+    ports:
+      # Only this machine can reach the server directly; the HTTPS proxy talks to it.
+      - "127.0.0.1:${SHUTTLE_LOCAL_PORT:-8787}:8787"
+    mem_limit: 384m
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }
+    stop_grace_period: 20s
+
+  caddy:
+    profiles: ["https"]
+    image: caddy:2.10.2
+    restart: unless-stopped
+    environment:
+      SHUTTLE_DOMAIN: ${SHUTTLE_DOMAIN:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    depends_on: [shuttle]
+
+volumes:
+  shuttle-data:
+  caddy-data:

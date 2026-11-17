@@ -261,6 +261,8 @@ export interface ErrorBody { error: { code: string; message?: string; retryAfter
 export interface DeviceDescriptor { name: string; platform: string; clientVersion: string }
 export interface LoginRequest { username: string; password: string; device: DeviceDescriptor }
 export interface EnrollRequest { code: string; device: DeviceDescriptor }
+/** First-run setup (lead decision D14): the code the server logs while it has no users creates the owner. */
+export interface SetupRequest { code: string; username: string; password: string; device: DeviceDescriptor }
 export type UserRole = 'owner' | 'member';
 export interface UserInfo { userId: string; username: string; role: UserRole | string }
 export interface AuthResponse { token: string; deviceId: DeviceId; user: UserInfo }
@@ -275,7 +277,8 @@ export interface EnrollCodeResponse { code: string; expiresAt: number; link: str
 export interface DevicesResponse { devices: DeviceInfo[] }
 export interface RenameDeviceRequest { name: string }
 
-export interface HealthResponse { ok: boolean; server: string; protocols: number[]; time: number; source: string; limits?: WelcomeLimits }
+/** `setup` (additive, D14): true while the server has no users and accepts POST /v1/auth/setup. */
+export interface HealthResponse { ok: boolean; server: string; protocols: number[]; time: number; source: string; limits?: WelcomeLimits; setup?: boolean }
 
 export interface VaultSummary {
   vaultId: string; name: string; role: string; createdAt: number; headSeq: Seq;

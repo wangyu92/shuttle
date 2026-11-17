@@ -9,6 +9,7 @@
   "types": "src/index.ts",
   "devDependencies": {
     "@shuttle/testkit": "0.0.0",
+    "jsqr": "1.4.0",
     "obsidian": "1.14.4"
   },
   "dependencies": {
@@ -16,6 +17,7 @@
     "@shuttle/adapter-server": "0.0.0",
     "@shuttle/crypto": "0.0.0",
     "@shuttle/engine": "0.0.0",
-    "@shuttle/protocol": "0.0.0"
+    "@shuttle/protocol": "0.0.0",
+    "qrcode-generator": "2.0.4"
   }
 }

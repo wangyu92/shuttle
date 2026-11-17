@@ -1,10 +1,11 @@
 // Server state and the operations shared by REST and WebSocket (design §2.8, §2.9). AGPL-3.0-only.
+import { timingSafeEqual } from "node:crypto";
 import { mkdirSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import { CloseCode, MAX_SEQ } from "@shuttle/protocol";
 import type { CommitRequest, VaultInfoEnvelope, VersionRecord } from "@shuttle/protocol";
-import { FailureLimiter, TokenBuckets, newDeviceToken, tokenHash } from "./auth";
+import { FailureLimiter, TokenBuckets, enrollCodeHash, newDeviceToken, newEnrollCode, normalizeEnrollCode, tokenHash } from "./auth";
 import { BlobStore } from "./blobs";
 import type { ResolvedConfig } from "./config";
 import { Stmts, openDb, txImmediate } from "./db";
@@ -13,7 +14,7 @@ import { Store, type CommitOutcome, type VaultRow } from "./store";
 import { HttpError, MINUTE_MS, randomId16, sha256Hex } from "./util";
 import { Hub } from "./ws";
 
-export const SERVER_VERSION = "0.1.1";
+export const SERVER_VERSION = "0.2.0";
 /** Commits per group-commit transaction. */
 const MAX_GROUP = 256;
 
@@ -48,6 +49,8 @@ export class Server {
   private queue: Array<{ vid: string; deviceId: string; req: CommitRequest; expectEpoch: number | undefined; done: (r: CommitOutcome | Error) => void }> = [];
   private flushScheduled = false;
   private closing = false;
+  /** sha256 of the first-run setup code (D14); null once a user exists or before openSetup(). */
+  private setupHash: Buffer | null = null;
 
   constructor(readonly cfg: ResolvedConfig) {
     const d = cfg.dataDir;
@@ -103,6 +106,51 @@ export class Server {
     this.cfg.log(`${via}: device has seen seqs above the head during a restore; head raised by ${to - v.head_seq}${to < seen ? " (capped)" : ""}`);
     this.hwm.mark(v.vault_id);
     return { v: this.store.vault(v.vault_id) ?? v, outcome: "raised" };
+  }
+
+  // ---------------- first-run setup (lead decision D14) ----------------
+
+  /**
+   * With no users in the DB, make a one-time setup code and return it for the startup log; only its
+   * hash is kept, in memory, so a restart makes a new one. Null when users exist (setup is closed).
+   */
+  openSetup(): string | null {
+    if (this.userCount() > 0) { this.setupHash = null; return null; }
+    const code = newEnrollCode();
+    this.setupHash = enrollCodeHash(normalizeEnrollCode(code)!);
+    return code;
+  }
+
+  /** Cheap pre-check before the password hash, so unauthenticated requests cannot burn scrypt. */
+  setupCodeMatches(code: string): boolean {
+    const norm = normalizeEnrollCode(code);
+    return this.setupHash !== null && norm !== null && timingSafeEqual(enrollCodeHash(norm), this.setupHash);
+  }
+
+  setupOpen(): boolean {
+    if (this.setupHash === null) return false;
+    if (this.userCount() > 0) { this.setupHash = null; return false; }
+    return true;
+  }
+
+  /**
+   * Create the owner and its first device, inside the caller's transaction. Null when the code is
+   * wrong or any user exists (an admin CLI `user add` also closes setup). The code works once.
+   */
+  claimSetup(code: string, username: string, pwHash: string, d: { name: string; platform: string; clientVersion: string | null }): { user: UserRow; token: string; deviceId: string } | null {
+    const norm = normalizeEnrollCode(code);
+    if (this.setupHash === null || norm === null || this.userCount() > 0) return null;
+    if (!timingSafeEqual(enrollCodeHash(norm), this.setupHash)) return null;
+    const userId = randomId16();
+    this.s.run("INSERT INTO users (user_id, username, pw_hash, role, created_at) VALUES (?, ?, ?, 'owner', ?)", userId, username, pwHash, this.cfg.now());
+    const created = this.createDevice(userId, d);
+    this.setupHash = null;
+    const user = this.s.get<UserRow>("SELECT * FROM users WHERE user_id = ?", userId)!;
+    return { user, ...created };
+  }
+
+  private userCount(): number {
+    return this.s.get<{ n: number }>("SELECT COUNT(*) AS n FROM users")?.n ?? 0;
   }
 
   // ---------------- auth ----------------

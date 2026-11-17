@@ -8,7 +8,7 @@ import {
   HEADER_SERVER, HEADER_SHA256, LIVE_MAX_BYTES, PACK_CONTENT_TYPE, PAIRING_TTL_SEC, PackError, SNAPSHOT_PAGE_DEFAULT,
   SNAPSHOT_PAGE_MAX, SUPPORTED_PROTOCOLS, checkCommitLimits, decodePack, encodePack, isBlobId, isDeviceId, isFileId,
   isPairId, isSeq, isSha256Hex, isVaultId, validateAckRequest, validateCommitRequest, validateCreateVaultRequest,
-  validateEnrollCodeRequest, validateEnrollRequest, validateLoginRequest, validateMissingBlobsRequest,
+  validateEnrollCodeRequest, validateEnrollRequest, validateLoginRequest, validateMissingBlobsRequest, validateSetupRequest,
   validatePackGetRequest, validatePairingBody, validateRebuildRequest, validateRenameDeviceRequest,
   validateVaultInfoEnvelope,
 } from "@shuttle/protocol";
@@ -16,7 +16,7 @@ import type {
   AuthResponse, ChangesResponse, CreateVaultResponse, DeviceDescriptor, DeviceInfo, EnrollCodeResponse, ErrorBody,
   HealthResponse, MeResponse, PackEntry, SnapshotReason, SnapshotResponse, UserInfo, Validation, VaultSummary,
 } from "@shuttle/protocol";
-import { enrollCodeHash, newEnrollCode, normalizeEnrollCode, verifyPassword } from "./auth";
+import { enrollCodeHash, hashPassword, newEnrollCode, normalizeEnrollCode, verifyPassword } from "./auth";
 import { looksSealed } from "./blobs";
 import { txImmediate } from "./db";
 import type { DeviceRow, Server, UserRow } from "./server-core";
@@ -167,6 +167,7 @@ async function route(srv: Server, c: Ctx): Promise<void> {
     const body: HealthResponse = {
       ok: true, server: srv.version, protocols: [...SUPPORTED_PROTOCOLS], time: Date.now(), source: srv.cfg.sourceUrl,
       limits: { ...srv.cfg.limits },
+      ...(srv.setupOpen() ? { setup: true } : {}),
     };
     return sendJson(c.res, 200, body);
   }
@@ -174,6 +175,7 @@ async function route(srv: Server, c: Ctx): Promise<void> {
     if (m !== "POST") methodNotAllowed();
     if (b === "login") return login(srv, c);
     if (b === "enroll") return enroll(srv, c);
+    if (b === "setup") return setup(srv, c);
     if (b === "logout") {
       const au = authenticate(srv, c);
       srv.revokeDevice(au.device.device_id);
@@ -307,6 +309,28 @@ async function enroll(srv: Server, c: Ctx): Promise<void> {
     throw new HttpError("CODE_EXPIRED", "enroll code expired, used or unknown");
   }
   const body: AuthResponse = { token: out.created.token, deviceId: out.created.deviceId, user: userInfo(out.user) };
+  sendJson(c.res, 200, body, { "Cache-Control": "no-store" });
+}
+
+/** First-run setup (lead decision D14): code from the startup log → owner account + first device. */
+async function setup(srv: Server, c: Ctx): Promise<void> {
+  const ipKey = `ip:${c.ip}`;
+  const wait = srv.loginLimiter.blockedFor(ipKey);
+  if (wait > 0) { c.req.resume(); throw new HttpError("RATE_LIMITED", "too many failed attempts", { retryAfterMs: wait }); }
+  if (!srv.setupOpen()) { c.req.resume(); throw new HttpError("CODE_EXPIRED", "setup is closed: this server already has an owner"); }
+  const { value } = await readJson(srv, c.req, validateSetupRequest, 64 * 1024);
+  if (!srv.setupCodeMatches(value.code)) {
+    srv.loginLimiter.fail(ipKey);
+    throw new HttpError("CODE_EXPIRED", "setup code wrong, or setup is closed");
+  }
+  const pwHash = await hashPassword(value.password, srv.cfg.scrypt);
+  const out = txImmediate(srv.db, () => srv.claimSetup(value.code, value.username, pwHash, descriptor(value.device)));
+  if (!out) {
+    srv.loginLimiter.fail(ipKey);
+    throw new HttpError("CODE_EXPIRED", "setup code wrong, or setup is closed");
+  }
+  srv.cfg.log(`first-run setup: owner ${value.username} created; setup closed`);
+  const body: AuthResponse = { token: out.token, deviceId: out.deviceId, user: userInfo(out.user) };
   sendJson(c.res, 200, body, { "Cache-Control": "no-store" });
 }
 

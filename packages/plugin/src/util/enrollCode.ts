@@ -25,7 +25,8 @@ export function normalizeEnrollCode(input: string): string | null {
   return ENROLL_CODE_PREFIX + groups.join("-");
 }
 
-export interface EnrollLink { server: string | null; code: string | null; vault: string | null }
+/** `setup`: the code is a first-run setup code from the server log (lead decision D14), not an enroll code. */
+export interface EnrollLink { server: string | null; code: string | null; vault: string | null; setup?: boolean }
 
 /** Parse `obsidian://shuttle-enroll?server=…&code=…[&vault=…]`. Null when it is not such a link. */
 export function parseEnrollLink(text: string): EnrollLink | null {
@@ -33,13 +34,16 @@ export function parseEnrollLink(text: string): EnrollLink | null {
   const prefix = `obsidian://${ENROLL_URI_ACTION}?`;
   if (!t.startsWith(prefix)) return null;
   const q = new URLSearchParams(t.slice(prefix.length));
-  return fromParams({ server: q.get("server"), code: q.get("code"), vault: q.get("vault") });
+  return fromParams({ server: q.get("server"), code: q.get("code"), vault: q.get("vault"), setup: q.get("setup") });
 }
 
 /** Protocol-handler parameters (Obsidian passes the query as an object). */
 export function fromParams(p: Record<string, string | null | undefined>): EnrollLink {
   const code = p["code"] ? normalizeEnrollCode(p["code"]) : null;
-  return { server: p["server"] ? p["server"] : null, code, vault: p["vault"] ? p["vault"] : null };
+  return {
+    server: p["server"] ? p["server"] : null, code, vault: p["vault"] ? p["vault"] : null,
+    ...(p["setup"] === "1" ? { setup: true } : {}),
+  };
 }
 
 /** "I have a setup link or code" (design §5.5.2): either a link or a bare code. */

@@ -597,6 +597,15 @@ export const validateEnrollRequest = run<T.EnrollRequest>((v, p) => {
   if (!/^SXE(-[0-9A-HJKMNP-TV-Z]{4}){4,5}$/.test(str(o.code, `${p}.code`))) fail(`${p}.code`, "expected SXE-XXXX-… (Crockford base32)");
   deviceDescriptor(o.device, `${p}.device`);
 });
+export const USERNAME_RE = /^[A-Za-z0-9._-]{1,64}$/;
+export const MIN_OWNER_PASSWORD = 8;
+export const validateSetupRequest = run<T.SetupRequest>((v, p) => {
+  const o = obj(v, p);
+  if (!/^SXE(-[0-9A-HJKMNP-TV-Z]{4}){5}$/.test(str(o.code, `${p}.code`))) fail(`${p}.code`, "expected SXE-XXXX-… (Crockford base32)");
+  if (!USERNAME_RE.test(str(o.username, `${p}.username`, 1, 64))) fail(`${p}.username`, "1-64 of A-Z a-z 0-9 . _ -");
+  str(o.password, `${p}.password`, MIN_OWNER_PASSWORD, 1024);
+  deviceDescriptor(o.device, `${p}.device`);
+});
 export const validateEnrollCodeRequest = run<T.EnrollCodeRequest>((v, p) => pos(obj(v, p).ttlSec, `${p}.ttlSec`));
 export const validateRenameDeviceRequest = run<T.RenameDeviceRequest>((v, p) => { str(obj(v, p).name, `${p}.name`, 1, 200); });
 export const validateCreateVaultRequest = run<T.CreateVaultRequest>((v, p) => {
@@ -624,6 +633,7 @@ export const validateHealthResponse = run<T.HealthResponse>((v, p) => {
   nonNeg(o.time, `${p}.time`);
   str(o.source, `${p}.source`);
   if (o.limits !== undefined) welcomeLimits(o.limits, `${p}.limits`);
+  if (o.setup !== undefined) bool(o.setup, `${p}.setup`);
 });
 export const validateAuthResponse = run<T.AuthResponse>((v, p) => {
   const o = obj(v, p);

@@ -1,7 +1,8 @@
 # shuttle-server image (design §2.8.9). The image holds only the esbuild bundle: no npm, no
 # node_modules. Build the bundle first, then build from the repository root:
 #   node scripts/build.mjs server
-#   docker build -f packages/server/Dockerfile -t shuttle-server:0.1.0 .
+#   docker build -f packages/server/Dockerfile -t shuttle-server:dev .
+# Published images: ghcr.io/wangyu92/shuttle-server (.github/workflows/server-image.yml, amd64 + arm64).
 # State lives in the /data bind mount, never in the container layer.
 FROM node:22-bookworm-slim@sha256:5ec23b7c622b00547753bc6ffd78085dd868a68aeb41c8e0a1418f033e13d96d
 

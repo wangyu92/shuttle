@@ -162,10 +162,15 @@ describe("ObsidianLocalFs", () => {
     expect(left).toEqual([]);
   });
 
-  it("D15: a new file on mobile still goes through the temp (nothing open to keep)", async () => {
+  it("D17: a new file on mobile is created through Vault (indexed at once), never renamed in from a temp", async () => {
     const { v, fs } = setup();
-    await replaceFile(fs, "d/new.md", te.encode("hi"), { mtime: 2 });
-    expect(v.text("d/new.md")).toBe("hi");
+    v.calls.length = 0;
+    await replaceFile(fs, "d/new.png", new Uint8Array([1, 2, 3]), { mtime: 2 });
+    expect(v.calls).toContain("createBinary:d/new.png");
+    expect(v.calls.some((c) => c.includes("rename") || c.includes("shuttle-replace"))).toBe(false);
+    const left: string[] = [];
+    for await (const b of fs.listInternal()) for (const s of b) left.push(s.path);
+    expect(left).toEqual([]);
   });
 
   it("D11: listInternal finds swap leftovers Vault does not index (also under the configuration folder)", async () => {

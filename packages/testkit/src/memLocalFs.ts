@@ -55,14 +55,16 @@ export interface MemLocalFsOptions {
    *  - 'rename' (default): a rename from a replace temp replaces an existing file (desktop, D8);
    *  - 'atomic': write() replaces atomically (`atomicReplace`, the headless NodeLocalFs, D10). A torn
    *    write then leaves the target whole (the prefix stays in a hidden temp that is gone);
-   *  - 'swap': no rename may replace an existing file (`renameReplaces: false`, Obsidian mobile, D11).
+   *  - 'swap': no rename may replace an existing file (`renameReplaces: false`, Obsidian mobile, D11);
+   *  - 'inplace': 'swap' plus `inPlaceReplace` (Obsidian mobile since D15/D17): replaceFile is one
+   *    plain write(), so a crash can tear the target itself.
    */
   replace?: MemReplaceMode;
   /** Declare the capability flags of `replace` (default true). false: leave them absent (unknown platform). */
   declareReplace?: boolean;
 }
 
-export type MemReplaceMode = 'rename' | 'atomic' | 'swap';
+export type MemReplaceMode = 'rename' | 'atomic' | 'swap' | 'inplace';
 
 interface PendingFault { op: FsOp; code: LocalFsErrorCode; path?: string; skip: number }
 
@@ -128,6 +130,7 @@ export class MemLocalFs implements LocalFs {
   readonly replaceMode: MemReplaceMode;
   readonly atomicReplace?: boolean;
   readonly renameReplaces?: boolean;
+  readonly inPlaceReplace?: boolean;
 
   private nodes = new Map<string, Node>();
   private nextIno = 1;
@@ -159,7 +162,8 @@ export class MemLocalFs implements LocalFs {
     this.replaceMode = o.replace ?? "rename";
     if (o.declareReplace ?? true) {
       if (this.replaceMode === "atomic") this.atomicReplace = true;
-      this.renameReplaces = this.replaceMode !== "swap";
+      this.renameReplaces = this.replaceMode !== "swap" && this.replaceMode !== "inplace";
+      if (this.replaceMode === "inplace") this.inPlaceReplace = true;
     }
   }
 
@@ -361,7 +365,7 @@ export class MemLocalFs implements LocalFs {
     // replaces an existing file at the target; every other rename refuses an occupied target.
     // In 'swap' mode (D11, Obsidian mobile) no rename replaces anything.
     const replace = dst !== null && dst !== undefined && !sameNode && src.kind === "file" && dst.kind === "file" &&
-      baseName(from).startsWith(REPLACE_TEMP_PREFIX) && this.replaceMode !== "swap";
+      baseName(from).startsWith(REPLACE_TEMP_PREFIX) && this.replaceMode !== "swap" && this.replaceMode !== "inplace";
     if (dst && !sameNode && !replace) throw new LocalFsError("EEXIST", to);
     if (replace && dst) this.nodes.delete(this.key(dst.name));
     if (src.kind === "folder" && (this.key(to) + "/").startsWith(this.key(from) + "/")) {

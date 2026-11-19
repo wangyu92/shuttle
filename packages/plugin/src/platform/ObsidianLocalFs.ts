@@ -151,6 +151,9 @@ export class ObsidianLocalFs implements LocalFs {
   /**
    * D15: on mobile an existing file is replaced in place (Vault.modifyBinary), because the D11 swap
    * moves the target aside and Obsidian closes the editor that shows it (seen on Android, 2026-11-17).
+   * D17: a new file is created with Vault.createBinary for the same reason the other way round: a file
+   * renamed in from a dot temp under the adapter stays unknown to Vault until restart ("could not be
+   * found" embeds, seen on Android, 2026-11-19).
    */
   get inPlaceReplace(): boolean {
     return !this.renameReplaces;

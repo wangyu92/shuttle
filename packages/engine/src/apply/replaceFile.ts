@@ -134,7 +134,9 @@ export async function replaceFile(fs: LocalFs, path: string, data: Uint8Array, o
   await fs.mkdirp(dir).catch(() => undefined);
   await settleLeftovers(fs, path);
   if (fs.atomicReplace === true) return fs.write(path, data, opts);       // D10
-  if (fs.inPlaceReplace === true && (await fs.stat(path)) !== null) return fs.write(path, data, opts); // D15
+  // D15: existing files in place (an open editor keeps them). D17: new files too, so the platform's own
+  // create call registers them (Obsidian mobile does not index a file renamed in under its adapter).
+  if (fs.inPlaceReplace === true) return fs.write(path, data, opts);
   const tmp = join(dir, `${REPLACE_TEMP_PREFIX}${nextSeq(fs)}`);
   let flying = inFlight.get(fs);
   if (!flying) inFlight.set(fs, (flying = new Set()));

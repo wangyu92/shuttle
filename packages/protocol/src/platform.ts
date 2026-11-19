@@ -50,8 +50,9 @@ export interface LocalFs {
   /**
    * Lead decision D15: true when the platform must write an existing file in place for open editors to
    * keep it (Obsidian mobile: the D11 swap moves the target aside and the editor showing it closes).
-   * The engine then replaces with one write() and accepts that a crash may tear the target; the write
-   * intent (§3.8.4) finds the torn file on the next start and pulls it again.
+   * D17: new files are written with one write() too, so the platform's create call indexes them
+   * (Obsidian mobile does not see a file renamed in from a dot temp until restart). The engine accepts
+   * that a crash may tear the file; the write intent (§3.8.4) finds it on the next start and pulls it again.
    */
   readonly inPlaceReplace?: boolean;
   /**
